@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  # MSSQL MCP server - connects to an existing SQL Server instance
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mssql-mcp
+    environment:
+      # Database Connection settings
+      - SQL_SERVER=${SQL_SERVER:-172.31.64.1}
+      - SQL_PORT=${SQL_PORT:-1433}
+      - SQL_USER=${SQL_USER:-sa}
+      - SQL_PASSWORD=${SQL_PASSWORD:-StrongPassword123!}
+      - SQL_DATABASE=${SQL_DATABASE:-DatabaseName}
+      
+      # Security settings
+      - SQL_ENCRYPT=${SQL_ENCRYPT:-true}
+      - SQL_TRUST_SERVER_CERT=${SQL_TRUST_SERVER_CERT:-true}
+      
+      # Connection timeouts
+      - SQL_CONNECTION_TIMEOUT=${SQL_CONNECTION_TIMEOUT:-30000}
+      - SQL_REQUEST_TIMEOUT=${SQL_REQUEST_TIMEOUT:-30000}
+      
+      # Connection pool settings
+      - SQL_POOL_MAX=${SQL_POOL_MAX:-10}
+      - SQL_POOL_MIN=${SQL_POOL_MIN:-0}
+      - SQL_POOL_IDLE_TIMEOUT=${SQL_POOL_IDLE_TIMEOUT:-30000}
+      
+      # MCP server settings
+      - MCP_SERVER_NAME=${MCP_SERVER_NAME:-"MSSQL Server"}
+      - MCP_SERVER_VERSION=${MCP_SERVER_VERSION:-"1.0.0"}
+      
+    restart: unless-stopped
+    networks:
+      - mcp-network
+
+networks:
+  mcp-network:
+    name: mcp_network
+    driver: bridge

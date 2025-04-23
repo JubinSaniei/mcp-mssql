@@ -1,0 +1,28 @@
+# Version control
+.git
+.gitignore
+
+# Node.js dependencies
+node_modules
+npm-debug.log
+
+# Build artifacts
+dist
+
+# Docker files
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Local environment files
+.env
+.env.local
+run.js
+
+# Runtime data
+logs
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
