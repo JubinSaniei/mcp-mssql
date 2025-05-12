@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # MSSQL MCP server - connects to an existing SQL Server instance
   mcp-server:
@@ -9,29 +7,35 @@ services:
     container_name: mssql-mcp
     environment:
       # Database Connection settings
-      - SQL_SERVER=${SQL_SERVER:-172.31.64.1}
-      - SQL_PORT=${SQL_PORT:-1433}
-      - SQL_USER=${SQL_USER:-sa}
-      - SQL_PASSWORD=${SQL_PASSWORD:-StrongPassword123!}
-      - SQL_DATABASE=${SQL_DATABASE:-DatabaseName}
+      - SQL_SERVER=${SQL_SERVER}
+      - SQL_PORT=${SQL_PORT}
+      - SQL_USER=${SQL_USER}
+      - SQL_PASSWORD=${SQL_PASSWORD}
+      - SQL_DATABASE=${SQL_DATABASE}
       
       # Security settings
-      - SQL_ENCRYPT=${SQL_ENCRYPT:-true}
-      - SQL_TRUST_SERVER_CERT=${SQL_TRUST_SERVER_CERT:-true}
-      
+      - SQL_ENCRYPT=${SQL_ENCRYPT}
+      - SQL_TRUST_SERVER_CERT=${SQL_TRUST_SERVER_CERT}
+
+      # Add SQL_ALLOWED_DATABASES here
+      - SQL_ALLOWED_DATABASES=${SQL_ALLOWED_DATABASES} 
+
       # Connection timeouts
-      - SQL_CONNECTION_TIMEOUT=${SQL_CONNECTION_TIMEOUT:-30000}
-      - SQL_REQUEST_TIMEOUT=${SQL_REQUEST_TIMEOUT:-30000}
+      - SQL_CONNECTION_TIMEOUT=${SQL_CONNECTION_TIMEOUT}
+      - SQL_REQUEST_TIMEOUT=${SQL_REQUEST_TIMEOUT}
       
       # Connection pool settings
-      - SQL_POOL_MAX=${SQL_POOL_MAX:-10}
-      - SQL_POOL_MIN=${SQL_POOL_MIN:-0}
-      - SQL_POOL_IDLE_TIMEOUT=${SQL_POOL_IDLE_TIMEOUT:-30000}
+      - SQL_POOL_MAX=${SQL_POOL_MAX}
+      - SQL_POOL_MIN=${SQL_POOL_MIN}
+      - SQL_POOL_IDLE_TIMEOUT=${SQL_POOL_IDLE_TIMEOUT}
       
       # MCP server settings
-      - MCP_SERVER_NAME=${MCP_SERVER_NAME:-"MSSQL Server"}
-      - MCP_SERVER_VERSION=${MCP_SERVER_VERSION:-"1.0.0"}
+      - MCP_SERVER_NAME=${MCP_SERVER_NAME}
+      - MCP_SERVER_VERSION=${MCP_SERVER_VERSION}
       
+      # Logging settings
+      - LOG_LEVEL=${LOG_LEVEL}
+
     restart: unless-stopped
     networks:
       - mcp-network

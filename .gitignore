@@ -56,3 +56,6 @@ tmp/
 temp/
 *.bak
 *.backup
+**/.claude/settings.local.json
+.env
+.claude

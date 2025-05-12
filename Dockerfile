@@ -36,8 +36,6 @@ COPY --from=build /app/types.d.ts ./
 COPY --from=build /app/claude-mcp-config.json ./
 
 # Copy test scripts 
-COPY --from=build /app/test-mcp.sh ./
-COPY --from=build /app/test-session-persistence.sh ./
 COPY --from=build /app/docker-run.sh ./
 
 # Make scripts executable
