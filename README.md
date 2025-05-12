@@ -1,4 +1,4 @@
-# MCP SQL Server
+# MCP MSSQL Server
 
 This is a Model Context Protocol (MCP) server for SQL Server interactions. It allows Large Language Models (LLMs) to execute SQL queries, run stored procedures, and explore database schemas with enhanced security and robustness.
 
