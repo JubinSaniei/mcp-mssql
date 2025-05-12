@@ -15,12 +15,8 @@ out/
 *.tsbuildinfo
 
 # Environment variables
-.env
-.env.local
-.env.development
-.env.test
-.env.production
-.env.*
+.env*
+!.env.example
 
 # IDE and editor files
 .vscode/*
@@ -57,5 +53,4 @@ temp/
 *.bak
 *.backup
 **/.claude/settings.local.json
-.env
 .claude
