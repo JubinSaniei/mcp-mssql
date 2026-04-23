@@ -60,6 +60,7 @@ server.tool(
       logger.error({ err: error, query, database: rawDatabaseArg }, 'Error in execute_query tool handler');
       const mcpError = MssqlMcpError.fromError(error, ErrorType.QUERY_ERROR, { tool: 'execute_query', query, database: rawDatabaseArg } as ErrorDetails);
       return {
+        isError: true,
         content: [{
           type: "text" as const,
           text: JSON.stringify({
@@ -75,7 +76,7 @@ server.tool(
 
 // Stored procedure execution tool
 server.tool(
-  "execute_StoredProcedure",
+  "execute_stored_procedure",
   {
     procedure: z.string().describe("Stored procedure name to execute"),
     parameters: z.array(
@@ -95,7 +96,7 @@ server.tool(
     const { procedure, parameters = [], database: rawDatabaseArg } = args;
 
     try {
-      const result: StoredProcedureResult = await databaseService.executeStoredProcedure(procedure, parameters, rawDatabaseArg); // USE StoredProcedureResult type
+      const result: StoredProcedureResult = await databaseService.executeStoredProcedure(procedure, parameters, rawDatabaseArg);
       return {
         content: [{ 
           type: "text" as const, 
@@ -103,9 +104,10 @@ server.tool(
         }]
       };
     } catch (error: unknown) {
-      logger.error({ err: error, procedure, database: rawDatabaseArg }, 'Error in execute_StoredProcedure tool handler');
-      const mcpError = MssqlMcpError.fromError(error, ErrorType.STORED_PROCEDURE_ERROR, { tool: 'execute_StoredProcedure', procedure, database: rawDatabaseArg } as ErrorDetails);
+      logger.error({ err: error, procedure, database: rawDatabaseArg }, 'Error in execute_stored_procedure tool handler');
+      const mcpError = MssqlMcpError.fromError(error, ErrorType.STORED_PROCEDURE_ERROR, { tool: 'execute_stored_procedure', procedure, database: rawDatabaseArg } as ErrorDetails);
       return {
+        isError: true,
         content: [{ 
           type: "text" as const, 
           text: JSON.stringify({
@@ -122,7 +124,28 @@ server.tool(
 // Database schema resource
 server.resource(
   "schema",
-  new ResourceTemplate("schema://{database}", { list: undefined }),
+  new ResourceTemplate("schema://{database}", {
+    list: async () => {
+      const typedConfig = sqlConfig as SqlConfig;
+      const databases = typedConfig.allowedDatabases?.length
+        ? typedConfig.allowedDatabases
+        : [typedConfig.database];
+      return {
+        resources: databases.map(db => ({
+          uri: `schema://${db}`,
+          name: `Schema: ${db}`
+        }))
+      };
+    },
+    complete: {
+      database: async () => {
+        const typedConfig = sqlConfig as SqlConfig;
+        return typedConfig.allowedDatabases?.length
+          ? typedConfig.allowedDatabases
+          : [typedConfig.database];
+      }
+    }
+  }),
   async (uri, params: { database?: string | string[] }, context) => {
     const dbParam = params.database;
     const dbIdentifier = Array.isArray(dbParam) ? dbParam[0] || (sqlConfig as SqlConfig).database : (dbParam || (sqlConfig as SqlConfig).database);
@@ -225,7 +248,7 @@ async function main() {
 
     logger.info('MCP server ready');
     logger.info('Using DatabaseService for MSSQL operations.');
-    logger.info({ tools: ['execute_query', 'execute_StoredProcedure'], resources: ['schema://{database}'] }, 'Available MCP tools and resources');
+    logger.info({ tools: ['execute_query', 'execute_stored_procedure'], resources: ['schema://{database}'] }, 'Available MCP tools and resources');
     logger.info('MCP server is listening on stdio...');
     setInterval(() => { logger.debug('MCP process kept alive by interval'); }, 60000); // Added to keep process alive
   } catch (error: unknown) {

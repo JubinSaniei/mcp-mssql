@@ -59,26 +59,31 @@ interface SchemaQueryRow {
   ORDINAL_POSITION: number;
 }
 
-// NEW: Interface for executeQuery result
-export interface QueryResultSuccess {
+// Shared interface for a single recordset
+export interface Recordset {
   columns: string[];
-  rows: any[][]; // Values within rows can be of any SQL type
+  rows: any[][];
   recordCount: number;
+}
+
+// Interface for executeQuery result
+export interface QueryResultSuccess {
+  recordsets: Recordset[];
+  totalRecordCount: number;
 }
 export interface QueryResultMessage {
   message: string;
-  recordCount?: 0; // Explicitly state no records for message-only responses
+  recordCount?: 0;
 }
 export type QueryResult = QueryResultSuccess | QueryResultMessage;
 
-// NEW: Interface for executeStoredProcedure result
+// Interface for executeStoredProcedure result
 export interface StoredProcedureResultSuccess {
-  columns?: string[]; // Optional as some SPs might not return recordsets
-  rows?: any[][];    // Optional
-  recordCount?: number; // Optional
-  outputParameters?: Record<string, any>; // SP output parameters
-  returnValue: any; // SP return value
-  rowsAffected?: number[]; // rowsAffected is an array
+  recordsets: Recordset[];
+  totalRecordCount: number;
+  outputParameters?: Record<string, any>;
+  returnValue: any;
+  rowsAffected?: number[];
 }
 export interface StoredProcedureResultMessage {
   message: string;
@@ -653,7 +658,7 @@ export class DatabaseService {
           lowercaseQuery.includes('reconfigure') ||
           lowercaseQuery.includes('waitfor delay')) {
         throw new MssqlMcpError(
-          'DatabaseService: Potentially unsafe query detected. Stored procedures, system procedures, and waitfor delay are not allowed in direct queries. Use the execute_StoredProcedure tool for stored procedures.',
+          'DatabaseService: Potentially unsafe query detected. Stored procedures, system procedures, and waitfor delay are not allowed in direct queries. Use the execute_stored_procedure tool for stored procedures.',
           ErrorType.VALIDATION_ERROR,
           undefined,
           { query }
@@ -662,43 +667,47 @@ export class DatabaseService {
 
       const result = await currentPool.request().query(query);
 
-      // The primary recordset is in result.recordset
-      // If multiple recordsets, they are in result.recordsets (an array)
-      // We will primarily work with the first recordset for this MCP tool.
-      const recordset: sql.IRecordSet<any> | undefined = result.recordset;
+      // Iterate all recordsets (result.recordsets is an array of recordsets)
+      const rawRecordsets = result.recordsets as unknown as Array<sql.IRecordSet<any>>;
+      const allRecordsets: Recordset[] = [];
+      let totalRecordCount = 0;
 
-      if (recordset && recordset.length > 0) {
-        // We have records in the first recordset
-        return {
-            columns: Object.keys(recordset[0]), // Get column names from the first row
-            rows: recordset.map(row => Object.values(row)),
-            recordCount: recordset.length
-        };
-      } else if (recordset) {
-        // Query executed, returned no rows (recordset is empty), but we might have column metadata
-        // from the recordset object itself (recordset.columns)
-        let columnNames: string[] = [];
-        if (recordset.columns) {
-            // recordset.columns is a map-like object: { [colName: string]: { index: number, name: string, ... } }
-            // We need to extract names, preferably in order.
-            const colArray = Object.values(recordset.columns); // Get array of column metadata objects
-            colArray.sort((a, b) => a.index - b.index); // Sort by index to maintain order
-            columnNames = colArray.map(c => c.name);
+      if (rawRecordsets && rawRecordsets.length > 0) {
+        for (const rs of rawRecordsets) {
+          if (rs && rs.length > 0) {
+            allRecordsets.push({
+              columns: Object.keys(rs[0]),
+              rows: rs.map((row: any) => Object.values(row)),
+              recordCount: rs.length
+            });
+            totalRecordCount += rs.length;
+          } else if (rs) {
+            // Empty recordset — extract column metadata if available
+            let columnNames: string[] = [];
+            if ((rs as any).columns) {
+              const colArray = Object.values((rs as any).columns) as Array<{ index: number; name: string }>;
+              colArray.sort((a, b) => a.index - b.index);
+              columnNames = colArray.map(c => c.name);
+            }
+            allRecordsets.push({
+              columns: columnNames,
+              rows: [],
+              recordCount: 0
+            });
+          }
         }
+      }
+
+      if (allRecordsets.length > 0) {
         return {
-            columns: columnNames,
-            rows: [],
-            recordCount: 0
+          recordsets: allRecordsets,
+          totalRecordCount
         };
       } else {
-        // This case implies no recordset was returned at all (e.g. DDL, or certain types of errors not caught below)
-        // For SELECT queries, mssql usually returns an empty recordset if no rows match.
-        // If it truly is a successful query with no recordset (unlikely for SELECT), return empty success.
-        this.logger.info({ query, result }, "Query executed but returned no primary recordset. Assuming success with no data.");
+        this.logger.info({ query, result }, "Query executed but returned no recordsets. Assuming success with no data.");
         return {
-            columns: [],
-            rows: [],
-            recordCount: 0
+          recordsets: [{ columns: [], rows: [], recordCount: 0 }],
+          totalRecordCount: 0
         };
       }
     } catch (error: unknown) {
@@ -810,22 +819,52 @@ export class DatabaseService {
 
       const result = await request.execute(procedure);
 
-      if (result.recordset && result.recordset.length > 0) {
+      // Iterate all recordsets (result.recordsets is an array of recordsets)
+      const rawRecordsets = result.recordsets as unknown as Array<sql.IRecordSet<any>>;
+      const allRecordsets: Recordset[] = [];
+      let totalRecordCount = 0;
+
+      if (rawRecordsets && rawRecordsets.length > 0) {
+        for (const rs of rawRecordsets) {
+          if (rs && rs.length > 0) {
+            allRecordsets.push({
+              columns: Object.keys(rs[0]),
+              rows: rs.map((row: any) => Object.values(row)),
+              recordCount: rs.length
+            });
+            totalRecordCount += rs.length;
+          } else if (rs) {
+            // Empty recordset — extract column metadata if available
+            let columnNames: string[] = [];
+            if ((rs as any).columns) {
+              const colArray = Object.values((rs as any).columns) as Array<{ index: number; name: string }>;
+              colArray.sort((a, b) => a.index - b.index);
+              columnNames = colArray.map(c => c.name);
+            }
+            allRecordsets.push({
+              columns: columnNames,
+              rows: [],
+              recordCount: 0
+            });
+          }
+        }
+      }
+
+      if (allRecordsets.length > 0) {
         return {
-            columns: Object.keys(result.recordset[0]),
-            rows: result.recordset.map(row => Object.values(row)),
-            recordCount: result.recordset.length,
-            outputParameters: result.output,
-            returnValue: result.returnValue,
-            rowsAffected: result.rowsAffected
+          recordsets: allRecordsets,
+          totalRecordCount,
+          outputParameters: result.output,
+          returnValue: result.returnValue,
+          rowsAffected: result.rowsAffected
         };
       } else {
         return {
-            message: "Stored procedure executed successfully, but returned no records",
-            outputParameters: result.output,
-            returnValue: result.returnValue,
-            rowsAffected: result.rowsAffected,
-            recordCount: 0
+          message: "Stored procedure executed successfully, but returned no records",
+          outputParameters: result.output,
+          returnValue: result.returnValue,
+          rowsAffected: result.rowsAffected,
+          recordCount: 0
         };
       }
     } catch (error: unknown) {

@@ -93,7 +93,7 @@ In the Claude conversation, you can:
 
 2.  Execute stored procedures:
     ```xml
-    <mcp:execute_StoredProcedure database="YourDatabaseName">
+    <mcp:execute_stored_procedure database="YourDatabaseName">
     {
       "procedure": "YourSchema.YourProcedureName",
       "parameters": [
@@ -101,7 +101,7 @@ In the Claude conversation, you can:
         {"name": "Param2", "type": "Int", "value": 123}
       ]
     }
-    </mcp:execute_StoredProcedure>
+    </mcp:execute_stored_procedure>
     ```
 
 3.  Explore database schema:

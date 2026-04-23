@@ -11,7 +11,7 @@ The `SQL_DATABASE` environment variable specifies the **default database** that 
 **Key characteristics:**
 
 *   **Initial Connection:** When the server initializes its connection pool, it typically uses the database specified by `SQL_DATABASE` as the context for the initial connections.
-*   **Fallback for Operations:** If an LLM sends a request (e.g., `execute_query`, `execute_StoredProcedure`, or `schema` resource access) without explicitly naming a target database, the operation is performed against this default `SQL_DATABASE`.
+*   **Fallback for Operations:** If an LLM sends a request (e.g., `execute_query`, `execute_stored_procedure`, or `schema` resource access) without explicitly naming a target database, the operation is performed against this default `SQL_DATABASE`.
 *   **Operational Convenience:** It provides a convenient default, so users don't have to specify the database for every single interaction if they are primarily working with one database.
 
 **Example:**
@@ -28,7 +28,7 @@ The `SQL_ALLOWED_DATABASES` environment variable defines an **explicit list of d
 *   **Enforcement:**
     *   **If `SQL_ALLOWED_DATABASES` is set and is not empty:** Before any database operation (query, stored procedure, schema fetch), the `DatabaseService` checks if the target database (whether it's the default `SQL_DATABASE` or one specified in the LLM's request) is present in this whitelist. If the target database is not in the list, the operation is denied with a permission error.
     *   **If `SQL_ALLOWED_DATABASES` is not set or is an empty string:** The `config.js` file initializes `sqlConfig.allowedDatabases` as an empty array (`[]`). The permission check logic in `DatabaseService.ts` (`if (this.sqlConfig.allowedDatabases && this.sqlConfig.allowedDatabases.length > 0 && ...)`) means that if this list is empty, this specific whitelist check is bypassed. In this scenario, access is primarily governed by the database permissions granted to the `SQL_USER`.
-*   **Scope:** This check applies to all database interaction tools and resources (`execute_query`, `execute_StoredProcedure`, `schema`).
+*   **Scope:** This check applies to all database interaction tools and resources (`execute_query`, `execute_stored_procedure`, `schema`).
 
 ## Key Differences and How They Work Together
 
