@@ -17,8 +17,8 @@ services:
       - SQL_ENCRYPT=${SQL_ENCRYPT}
       - SQL_TRUST_SERVER_CERT=${SQL_TRUST_SERVER_CERT}
 
-      # Add SQL_ALLOWED_DATABASES here
-      - SQL_ALLOWED_DATABASES=${SQL_ALLOWED_DATABASES} 
+      # Database whitelist
+      - SQL_ALLOWED_DATABASES=${SQL_ALLOWED_DATABASES}
 
       # Connection timeouts
       - SQL_CONNECTION_TIMEOUT=${SQL_CONNECTION_TIMEOUT}
@@ -28,10 +28,9 @@ services:
       - SQL_POOL_MAX=${SQL_POOL_MAX}
       - SQL_POOL_MIN=${SQL_POOL_MIN}
       - SQL_POOL_IDLE_TIMEOUT=${SQL_POOL_IDLE_TIMEOUT}
-      
-      # MCP server settings
-      - MCP_SERVER_NAME=${MCP_SERVER_NAME}
-      - MCP_SERVER_VERSION=${MCP_SERVER_VERSION}
+
+      # Query limits
+      - SQL_MAX_ROWS=${SQL_MAX_ROWS}
       
       # Logging settings
       - LOG_LEVEL=${LOG_LEVEL}

@@ -15,17 +15,17 @@ export const sqlConfig = {
     idleTimeoutMillis: parseInt(process.env.SQL_POOL_IDLE_TIMEOUT || "30000", 10),
   },
   options: {
-    encrypt: process.env.SQL_ENCRYPT === "true", // Use this if you're on Azure
-    trustServerCertificate: process.env.SQL_TRUST_SERVER_CERTIFICATE === "true", // Change to true for local dev / self-signed certs
+    encrypt: process.env.SQL_ENCRYPT !== "false", // Secure by default; opt-out with SQL_ENCRYPT=false
+    trustServerCertificate: process.env.SQL_TRUST_SERVER_CERT === "true" || process.env.SQL_TRUST_SERVER_CERTIFICATE === "true",
   },
   // Flattened retry configuration to match SqlConfig interface
   maxRetries: parseInt(process.env.SQL_RETRY_MAX_RETRIES || "3", 10),
   initialRetryDelay: parseInt(process.env.SQL_RETRY_DELAY_MS || "1000", 10),
-  maxRetryDelay: parseInt(process.env.SQL_RETRY_MAX_DELAY_MS || (parseInt(process.env.SQL_RETRY_DELAY_MS || "1000", 10) * 10).toString(), 10), // Default max delay to 10x initial delay
-  
-  // Renamed cacheTTL to schemaCacheTTL to match SqlConfig interface
-  schemaCacheTTL: parseInt(process.env.CACHE_TTL_MS || "300000", 10), // 5 minutes
+  maxRetryDelay: parseInt(process.env.SQL_RETRY_MAX_DELAY_MS || (parseInt(process.env.SQL_RETRY_DELAY_MS || "1000", 10) * 10).toString(), 10),
 
-  allowedDatabases: (process.env.SQL_ALLOWED_DATABASES || "").split(",").filter(Boolean),
+  schemaCacheTTL: parseInt(process.env.CACHE_TTL_MS || "300000", 10), // 5 minutes
+  maxRows: parseInt(process.env.SQL_MAX_ROWS || "1000", 10),
+
+  allowedDatabases: (process.env.SQL_ALLOWED_DATABASES || "").split(",").map(db => db.trim()).filter(Boolean),
   logLevel: process.env.LOG_LEVEL || "info",
 };

@@ -26,3 +26,10 @@ logs
 # System files
 .DS_Store
 Thumbs.db
+
+# Docs and non-essential files
+docs
+README.md
+FORGE.md
+*.zip
+*.md

@@ -54,3 +54,5 @@ temp/
 *.backup
 **/.claude/settings.local.json
 .claude
+*.zip
+.forge/MEMORY.md

@@ -7,8 +7,9 @@ import {
   QueryResult, 
   StoredProcedureResult 
 } from './DatabaseService.js'; // Import DatabaseService, SqlConfig, and result types
-import { MssqlMcpError, ErrorType, ErrorDetails } from './errors.js'; // Import ErrorDetails
-import { sqlConfig } from "./config.js"; 
+import { MssqlMcpError, ErrorType, ErrorDetails } from './errors.js';
+import { sqlConfig } from "./config.js";
+import type { McpServerWithRegisterTool } from './types.js';
 import pino from "pino";
 
 // Define mcpConfig for server name and version
@@ -17,13 +18,8 @@ const mcpConfig = {
   version: "1.0.1"
 };
 
-// Initialize Pino logger
-const loggerOptions = {
-  level: (sqlConfig as SqlConfig).logLevel || 'info',
-  // Pino's default timestamp is good, serializers can be added if needed
-};
-// pino.destination(2) creates a SonicBoom instance for stderr
-const logger = (pino as any)(loggerOptions, pino.destination(2));
+// pino.destination(2) writes to stderr so it doesn't interfere with stdio MCP transport
+const logger = (pino as any)({ level: (sqlConfig as SqlConfig).logLevel || 'info' }, pino.destination(2));
 
 // Create an MCP server
 const server = new McpServer({
@@ -31,18 +27,42 @@ const server = new McpServer({
   version: mcpConfig.version
 });
 
+// Cast to access registerTool — the method exists at runtime in SDK v1.23+ but
+// the published .d.ts has a deep-inference bug in the deprecated tool() overloads
+// that causes TS2589 when any method is called on the typed McpServer instance.
+const mcpServer = server as any as McpServerWithRegisterTool;
+
 // Instantiate DatabaseService - will be initialized in main()
 let databaseService: DatabaseService;
 
+// Tool parameter schemas
+const spParamSchema = z.object({
+  name: z.string().describe("Parameter name"),
+  type: z.string().describe("SQL parameter type (e.g., 'VarChar', 'Int')"),
+  value: z.unknown().optional().describe("Parameter value")
+});
+
+const executeQueryParams = {
+  query: z.string().describe("SQL query to execute"),
+  database: z.string().optional().describe("Target database name")
+};
+
+const executeSpParams = {
+  procedure: z.string().describe("Stored procedure name to execute"),
+  parameters: z.array(spParamSchema).optional().describe("Parameters for the stored procedure"),
+  database: z.string().optional().describe("Target database name")
+};
+
 // SQL query execution tool
-server.tool(
+mcpServer.registerTool(
   "execute_query",
   {
-    query: z.string().describe("SQL query to execute"),
-    database: z.string().optional().describe("Target database name")
+    description: "Execute a read-only SQL query against a SQL Server database. Supports SELECT statements only — use execute_stored_procedure for calling stored procedures.",
+    inputSchema: executeQueryParams,
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
   },
   async (args: { query: string; database?: string }, context) => {
-    logger.info({ tool: 'execute_query', arguments: args, context }, 'MCP execute_query tool received request');
+    logger.info({ tool: 'execute_query', arguments: args }, 'MCP execute_query tool received request');
 
     const { query, database: rawDatabaseArg } = args;
 
@@ -75,18 +95,12 @@ server.tool(
 );
 
 // Stored procedure execution tool
-server.tool(
+mcpServer.registerTool(
   "execute_stored_procedure",
   {
-    procedure: z.string().describe("Stored procedure name to execute"),
-    parameters: z.array(
-      z.object({
-        name: z.string().describe("Parameter name"),
-        type: z.string().describe("SQL parameter type (e.g., 'VarChar', 'Int')"),
-        value: z.any().optional().describe("Parameter value") 
-      })
-    ).optional().describe("Parameters for the stored procedure"),
-    database: z.string().optional().describe("Target database name")
+    description: "Execute a stored procedure on a SQL Server database",
+    inputSchema: executeSpParams,
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false }
   },
   async (args: { 
     procedure: string; 
@@ -244,13 +258,10 @@ async function main() {
   }
 
   try {
-    server.connect(transport);
+    await server.connect(transport);
 
     logger.info('MCP server ready');
-    logger.info('Using DatabaseService for MSSQL operations.');
     logger.info({ tools: ['execute_query', 'execute_stored_procedure'], resources: ['schema://{database}'] }, 'Available MCP tools and resources');
-    logger.info('MCP server is listening on stdio...');
-    setInterval(() => { logger.debug('MCP process kept alive by interval'); }, 60000); // Added to keep process alive
   } catch (error: unknown) {
     logger.fatal({ err: error }, 'Critical: Failed to start MCP server transport');
     await cleanup();

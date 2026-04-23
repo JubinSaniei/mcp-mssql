@@ -1,5 +1,5 @@
 # Build stage
-FROM node:23-slim AS build
+FROM node:22-slim AS build
 
 # Set working directory
 WORKDIR /app
@@ -15,13 +15,16 @@ COPY . .
 RUN npm run build
 
 # Production stage
-FROM node:23-slim AS production
+FROM node:22-slim AS production
 
 # Set working directory
 WORKDIR /app
 
 # Set environment variables
 ENV NODE_ENV=production
+
+# Create non-root user
+RUN addgroup --system app && adduser --system --ingroup app app
 
 # Copy package files
 COPY package*.json ./
@@ -35,23 +38,22 @@ COPY --from=build /app/config.js ./
 COPY --from=build /app/types.d.ts ./
 COPY --from=build /app/claude-mcp-config.json ./
 
-# Copy test scripts 
+# Copy scripts
 COPY --from=build /app/docker-run.sh ./
 
 # Make scripts executable
 RUN chmod +x *.sh
 
-# Create a simple entrypoint script for ESM handling
-RUN echo '#!/usr/bin/env node\n\
-// ESM entrypoint for MCP SQL Server with session persistence\n\
-console.log("Starting MCP SQL Server with session persistence...");\n\
-import "./dist/server.js";\n' > entrypoint.mjs && \
-chmod +x entrypoint.mjs
+# Create entrypoint (no stdout logging — would corrupt MCP stdio transport)
+RUN echo 'import "./dist/server.js";' > entrypoint.mjs
+
+# Switch to non-root user
+USER app
 
 # Add metadata about the image
 LABEL maintainer="MSSQL MCP Team"
-LABEL description="MCP SQL Server with session persistence for Claude and other LLMs"
-LABEL version="1.0.0"
+LABEL description="MCP SQL Server for Claude and other LLMs"
+LABEL version="1.0.1"
 
 # Set the default command - using stdio transport for MCP
 CMD ["node", "--enable-source-maps", "entrypoint.mjs"]
