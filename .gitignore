@@ -56,3 +56,4 @@ temp/
 .claude
 *.zip
 .forge/MEMORY.md
+.forge/

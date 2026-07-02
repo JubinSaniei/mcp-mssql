@@ -44,7 +44,9 @@ const spParamSchema = z.object({
 
 const executeQueryParams = {
   query: z.string().describe("SQL query to execute"),
-  database: z.string().optional().describe("Target database name")
+  database: z.string().optional().describe("Target database name"),
+  offset: z.number().int().min(0).optional().describe("Number of rows to skip (for pagination). Defaults to 0."),
+  limit: z.number().int().min(1).optional().describe("Maximum number of rows to return (for pagination). Defaults to server maxRows setting.")
 };
 
 const executeSpParams = {
@@ -57,17 +59,17 @@ const executeSpParams = {
 mcpServer.registerTool(
   "execute_query",
   {
-    description: "Execute a read-only SQL query against a SQL Server database. Supports SELECT statements only — use execute_stored_procedure for calling stored procedures.",
+    description: "Execute a read-only SQL query against a SQL Server database. Supports SELECT statements only — use execute_stored_procedure for calling stored procedures. Results are paginated: use offset and limit parameters to page through large result sets. The response includes pagination metadata (hasMore, nextOffset, totalRowsFetched) when results are truncated.",
     inputSchema: executeQueryParams,
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
   },
-  async (args: { query: string; database?: string }, context) => {
+  async (args: { query: string; database?: string; offset?: number; limit?: number }, context) => {
     logger.info({ tool: 'execute_query', arguments: args }, 'MCP execute_query tool received request');
 
-    const { query, database: rawDatabaseArg } = args;
+    const { query, database: rawDatabaseArg, offset, limit } = args;
 
     try {
-      const result: QueryResult = await databaseService.executeQuery(query, rawDatabaseArg); // USE QueryResult type
+      const result: QueryResult = await databaseService.executeQuery(query, rawDatabaseArg, offset, limit);
       logger.info({ result }, 'Query executed successfully');
       return {
         content: [{

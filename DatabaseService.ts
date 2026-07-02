@@ -115,6 +115,13 @@ export interface Recordset {
 export interface QueryResultSuccess {
   recordsets: Recordset[];
   totalRecordCount: number;
+  pagination?: {
+    offset: number;
+    limit: number;
+    hasMore: boolean;
+    nextOffset?: number;
+    totalRowsFetched: number;
+  };
 }
 export interface QueryResultMessage {
   message: string;
@@ -658,7 +665,7 @@ export class DatabaseService {
     }
   }
 
-  public async executeQuery(query: string, rawDatabaseArg?: string): Promise<QueryResult> {
+  public async executeQuery(query: string, rawDatabaseArg?: string, offset?: number, limit?: number): Promise<QueryResult> {
     const targetDatabase = rawDatabaseArg || this.sqlConfig.database;
     this.assertDatabaseAllowed(targetDatabase, 'query execution');
 
@@ -711,26 +718,31 @@ export class DatabaseService {
 
       const { recordsets, totalRecordCount } = this.parseRecordsets(result.recordsets);
 
-      // Enforce row limit per recordset
-      const maxRows = this.sqlConfig.maxRows ?? DEFAULT_MAX_ROWS;
-      let totalTruncated = 0;
-      const limitedRecordsets = recordsets.map(rs => {
-        if (rs.rows.length > maxRows) {
-          const truncated = rs.rows.length - maxRows;
-          totalTruncated += truncated;
-          return { ...rs, rows: rs.rows.slice(0, maxRows), recordCount: maxRows, truncated };
-        }
-        return rs;
+      // Apply pagination: offset skips rows, limit caps how many are returned
+      const effectiveLimit = limit ?? (this.sqlConfig.maxRows ?? DEFAULT_MAX_ROWS);
+      const effectiveOffset = offset ?? 0;
+
+      const paginatedRecordsets = recordsets.map(rs => {
+        const sliceStart = Math.min(effectiveOffset, rs.rows.length);
+        const sliceEnd = Math.min(sliceStart + effectiveLimit, rs.rows.length);
+        const slicedRows = rs.rows.slice(sliceStart, sliceEnd);
+        return { ...rs, rows: slicedRows, recordCount: slicedRows.length };
       });
 
-      if (totalTruncated > 0) {
-        this.logger.warn({ maxRows, totalTruncated }, 'DatabaseService: Query result truncated to maxRows limit.');
-      }
+      const returnedRows = paginatedRecordsets.reduce((sum, rs) => sum + rs.recordCount, 0);
+      const hasMore = totalRecordCount > effectiveOffset + effectiveLimit;
 
-      if (limitedRecordsets.length > 0) {
+      if (paginatedRecordsets.length > 0) {
         return {
-          recordsets: limitedRecordsets,
-          totalRecordCount: totalRecordCount > (maxRows * recordsets.length) ? limitedRecordsets.reduce((sum, rs) => sum + rs.recordCount, 0) : totalRecordCount
+          recordsets: paginatedRecordsets,
+          totalRecordCount,
+          pagination: {
+            offset: effectiveOffset,
+            limit: effectiveLimit,
+            hasMore,
+            ...(hasMore ? { nextOffset: effectiveOffset + effectiveLimit } : {}),
+            totalRowsFetched: returnedRows
+          }
         };
       } else {
         return {
