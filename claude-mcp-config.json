@@ -1,7 +1,7 @@
 {
   "name": "mssql-mcp",
   "command": "docker",
-  "args": ["exec", "-i", "mssql-mcp", "node", "entrypoint.mjs"],
+  "args": ["exec", "-i", "mssql-mcp", "node", "dist/server.js"],
   "allowedTools": ["execute_query", "execute_stored_procedure"],
   "allowedResources": ["schema"]
 }

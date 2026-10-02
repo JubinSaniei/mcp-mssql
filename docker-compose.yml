@@ -20,6 +20,9 @@ services:
       # Database whitelist
       - SQL_ALLOWED_DATABASES=${SQL_ALLOWED_DATABASES}
 
+      # Stored procedure allow-list; empty disables execute_stored_procedure
+      - SQL_ALLOWED_PROCEDURES=${SQL_ALLOWED_PROCEDURES}
+
       # Connection timeouts
       - SQL_CONNECTION_TIMEOUT=${SQL_CONNECTION_TIMEOUT}
       - SQL_REQUEST_TIMEOUT=${SQL_REQUEST_TIMEOUT}
@@ -35,6 +38,8 @@ services:
       # Logging settings
       - LOG_LEVEL=${LOG_LEVEL}
 
+    # The server shuts down when stdin closes; keep it open so clients can `docker exec -i` in
+    stdin_open: true
     restart: unless-stopped
     networks:
       - mcp-network

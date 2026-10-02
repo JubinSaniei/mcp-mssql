@@ -21,7 +21,7 @@ This script is an alternative to using `docker-compose.yml` or manually crafting
 
 ## Basic Usage
 
-To run the script with default settings (as defined within the script itself, which align with `config.js` defaults):
+To run the script with default settings (as defined within the script itself; they match the `config.ts` defaults except `SQL_ENCRYPT=false` and `SQL_TRUST_SERVER_CERTIFICATE=true`):
 
 ```bash
 ./docker-run.sh
@@ -96,20 +96,22 @@ You can override any of the variables defined at the top of the `docker-run.sh` 
 -   `SQL_RETRY_MAX_DELAY_MS`
 -   `CACHE_TTL_MS`
 -   `SQL_ALLOWED_DATABASES` (comma-separated list, e.g., "db1,db2")
+-   `SQL_ALLOWED_PROCEDURES` (comma-separated `schema.proc` names; empty disables `execute_stored_procedure`)
+-   `SQL_MAX_ROWS`
 -   `LOG_LEVEL`
 -   `CONTAINER_NAME`
 
-For a complete list and detailed explanation of what each variable does, please refer to the `CONFIG.MD` document.
+For a complete list and detailed explanation of what each variable does, please refer to [CONFIG.md](CONFIG.md).
 
 ## What the Script Does
 
 1.  **Sets Configuration**: It determines the values for various SQL Server and application settings based on (in order of precedence):
-    1.  Environment variables already set in your shell.
-    2.  Positional arguments (`$1` for `SQL_SERVER`, `$2` for `SQL_PASSWORD`).
+    1.  Positional arguments (`$1` for `SQL_SERVER`, `$2` for `SQL_PASSWORD`), when given and not empty.
+    2.  Environment variables already set in your shell.
     3.  Default values defined within the script.
 2.  **Stops and Removes Existing Container**: If a Docker container with the target name (default: `mssql-mcp`) already exists, it is stopped and removed (`docker rm -f`).
 3.  **Builds Image (if necessary)**: It checks if the Docker image `mssql-mcp` exists. If not, it builds it using `docker build -t mssql-mcp .` from the current directory (which should be the project root containing the `Dockerfile`).
-4.  **Runs New Container**: It starts a new Docker container in detached mode (`-d`) with the chosen name and passes all the configured variables as environment variables (`-e`) to the container.
+4.  **Runs New Container**: It starts a new Docker container in detached mode with stdin kept open (`-d -i`; the server shuts down when its stdin closes) with the chosen name, and passes all the configured variables as environment variables (`-e`) to the container. MCP clients then run the server inside it with `docker exec -i <CONTAINER_NAME> node dist/server.js`.
 5.  **Outputs Information**: It prints the main connection details and the container name.
 
 ## Checking Logs

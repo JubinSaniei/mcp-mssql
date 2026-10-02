@@ -1,53 +1,39 @@
 import sql from 'mssql';
 import { Logger } from 'pino';
-import { MssqlMcpError, ErrorType } from './errors.js';
-import nodeParser from 'node-sql-parser';
+import { MssqlMcpError, ErrorType, classifyError, extractDriverErrorInfo, toMssqlMcpError } from './errors.js';
+import { validateReadOnlyQuery } from './queryValidator.js';
+import {
+  RecordsetPager,
+  buildQueryResult,
+  resolvePageWindow,
+  type QueryResult,
+  type Recordset,
+} from './resultFormat.js';
+import {
+  buildAllowedProcedureSet,
+  prepareProcedureParameter,
+  requireProcedureName,
+  type ProcedureParameterInput,
+} from './procedures.js';
+import { SCHEMA_QUERY, buildTableSchemas, type ForeignKeyRow, type SchemaColumnRow, type TableSchema } from './schemaModel.js';
+import { formatOutputParameters } from './temporalFormat.js';
+import { installDateTimeOffsetPatch, type DateTimeOffsetMode } from './datetimeoffsetPatch.js';
+import { databaseNameKey, normalizeDatabaseName } from './databaseName.js';
+
+export type { QueryResult, Recordset, TableSchema, ProcedureParameterInput };
 
 // Default maximum rows returned per recordset if not configured
 const DEFAULT_MAX_ROWS = 1000;
 
-// System stored procedures that are never allowed to be executed
-const DENIED_SYSTEM_PROCEDURES: ReadonlySet<string> = new Set([
-  'xp_cmdshell',
-  'xp_regread',
-  'xp_regwrite',
-  'xp_regdelete',
-  'xp_regenumvalues',
-  'xp_servicecontrol',
-  'xp_availablemedia',
-  'xp_dirtree',
-  'xp_enumdsn',
-  'xp_enumerrorlogs',
-  'xp_fixeddrives',
-  'xp_loginconfig',
-  'xp_makecab',
-  'xp_msver',
-  'xp_sprintf',
-  'xp_sscanf',
-  'sp_configure',
-  'sp_addlogin',
-  'sp_droplogin',
-  'sp_adduser',
-  'sp_dropuser',
-  'sp_addrole',
-  'sp_droprole',
-  'sp_addrolemember',
-  'sp_droprolemember',
-  'sp_addsrvrolemember',
-  'sp_dropsrvrolemember',
-  'sp_password',
-  'sp_changedbowner',
-  'sp_addextendedproc',
-  'sp_dropextendedproc',
-  'sp_addlinkedserver',
-  'sp_droplinkedserver',
-  'sp_executesql',
-  'sp_oacreate',
-  'sp_oamethod',
-  'sp_oagetproperty',
-  'sp_oadestroy',
-  'sp_send_dbmail',
-]);
+// SQL Server error number for "The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION."
+const SQL_ERROR_NO_CORRESPONDING_BEGIN_TRAN = 3903;
+
+// SQL Server error number for "Cannot open database requested by the login."
+const SQL_ERROR_CANNOT_OPEN_DATABASE = 4060;
+
+// Pools for databases other than the default one are closed after this long without use
+const POOL_IDLE_TTL_MS = 10 * 60 * 1000;
+const POOL_SWEEP_INTERVAL_MS = 60 * 1000;
 
 // Define SqlConfig interface
 export interface SqlConfig {
@@ -64,174 +50,167 @@ export interface SqlConfig {
   schemaCacheTTL: number;
   maxRows?: number;
   allowedDatabases?: string[];
+  // Procedures execute_stored_procedure may run, as `schema.proc` names. Empty = none.
+  allowedProcedures: string[];
   options?: {
     encrypt?: boolean;
     trustServerCertificate?: boolean;
-    [key: string]: any;
   };
   pool?: {
     min?: number;
     max?: number;
     idleTimeoutMillis?: number;
-    [key: string]: any;
   };
   logLevel?: string;
 }
 
-// Type definitions
-interface TableSchema {
-  schema: string;
-  name: string;
-  fullName: string;
-  columns: Array<{
-    name: string;
-    type: string;
-    nullable: boolean;
-    primary: boolean;
-  }>;
-}
-
-interface SchemaQueryRow {
-  TABLE_SCHEMA: string;
-  TABLE_NAME: string;
-  COLUMN_NAME: string;
-  DATA_TYPE: string;
-  CHARACTER_MAXIMUM_LENGTH: number | null;
-  NUMERIC_PRECISION: number | null;
-  NUMERIC_SCALE: number | null;
-  IS_NULLABLE: 'YES' | 'NO';
-  IS_PRIMARY_KEY: 0 | 1;
-  ORDINAL_POSITION: number;
-}
-
-// Shared interface for a single recordset
-export interface Recordset {
-  columns: string[];
-  rows: any[][];
-  recordCount: number;
-}
-
-// Interface for executeQuery result
-export interface QueryResultSuccess {
+export interface StoredProcedureResult {
+  /** Result sets, each capped at maxRows rows; `hasMore` marks a capped result set. */
   recordsets: Recordset[];
-  totalRecordCount: number;
-  pagination?: {
-    offset: number;
-    limit: number;
-    hasMore: boolean;
-    nextOffset?: number;
-    totalRowsFetched: number;
-  };
+  outputParameters: Record<string, unknown>;
+  returnValue: unknown;
+  rowsAffected: number[];
 }
-export interface QueryResultMessage {
-  message: string;
-  recordCount?: 0;
-}
-export type QueryResult = QueryResultSuccess | QueryResultMessage;
 
-// Interface for executeStoredProcedure result
-export interface StoredProcedureResultSuccess {
-  recordsets: Recordset[];
-  totalRecordCount: number;
-  outputParameters?: Record<string, any>;
-  returnValue: any;
-  rowsAffected?: number[];
+export interface OperationOptions {
+  /** Aborting this signal cancels the running SQL; the transaction is still rolled back. */
+  signal?: AbortSignal;
 }
-export interface StoredProcedureResultMessage {
-  message: string;
-  outputParameters?: Record<string, any>;
-  returnValue: any;
-  rowsAffected?: number[];
-  recordCount?: 0;
+
+/** One cached connection pool, keyed by lower-cased database name. */
+interface PoolEntry {
+  key: string;
+  database: string;
+  pool: sql.ConnectionPool | null;
+  connecting: Promise<sql.ConnectionPool> | null;
+  /** Operations currently using this entry. */
+  active: number;
+  lastUsed: number;
+  /** A retired entry is no longer handed out; its pool is closed once `active` reaches 0. */
+  retired: boolean;
 }
-export type StoredProcedureResult = StoredProcedureResultSuccess | StoredProcedureResultMessage;
+
+type RollbackOutcome = 'rolled-back' | 'already-ended' | 'unsafe';
+
+interface StreamOutcome {
+  output: Record<string, unknown>;
+  returnValue: unknown;
+  rowsAffected: number[];
+}
+
+/** The tedious connection a transaction holds; read only to close it after a failed rollback. */
+interface HeldConnection {
+  close?: () => void;
+}
+
+function cancelledError(): MssqlMcpError {
+  return new MssqlMcpError('The request was cancelled by the client.', ErrorType.CANCELLED, undefined, undefined, { code: 'ECANCEL' });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw cancelledError();
+}
+
+function errorCode(error: unknown): string | undefined {
+  const code = error !== null && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  return typeof code === 'string' ? code : undefined;
+}
+
+function querySnippet(query: string): string {
+  return query.length > 100 ? `${query.substring(0, 100)}...` : query;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export class DatabaseService {
-  private pool: sql.ConnectionPool | null = null;
-  private connectionPromise: Promise<sql.ConnectionPool> | null = null;
-  private isConnecting: boolean = false;
-  private schemaCache: Map<string, { timestamp: number; data: TableSchema[] }> = new Map();
-  private connectionRetries: number = 0;
+  private readonly pools = new Map<string, PoolEntry>();
+  private readonly schemaCache: Map<string, { timestamp: number; data: TableSchema[] }> = new Map();
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  private closed = false;
 
   private readonly sqlConfig: SqlConfig;
   private readonly logger: Logger;
-  // Normalized allowedDatabases (lowercased, trimmed) for case-insensitive comparison
-  private readonly normalizedAllowedDatabases: string[];
-
-  // Map of string type names to mssql.ISqlTypeFactory objects
-  private readonly sqlDataTypeMap: Map<string, sql.ISqlTypeFactoryWithNoParams | sql.ISqlTypeFactoryWithLength | sql.ISqlTypeFactoryWithPrecisionScale | sql.ISqlTypeFactoryWithScale | sql.ISqlTypeFactoryWithTvpType> = new Map([
-    ['bigint', sql.BigInt],
-    ['binary', sql.Binary],
-    ['bit', sql.Bit],
-    ['char', sql.Char],
-    ['date', sql.Date],
-    ['datetime', sql.DateTime],
-    ['datetime2', sql.DateTime2],
-    ['datetimeoffset', sql.DateTimeOffset],
-    ['decimal', sql.Decimal],
-    ['float', sql.Float],
-    ['geography', sql.Geography],
-    ['geometry', sql.Geometry],
-    ['image', sql.Image],
-    ['int', sql.Int],
-    ['money', sql.Money],
-    ['nchar', sql.NChar],
-    ['ntext', sql.NText],
-    ['numeric', sql.Numeric],
-    ['nvarchar', sql.NVarChar],
-    ['real', sql.Real],
-    ['smalldatetime', sql.SmallDateTime],
-    ['smallint', sql.SmallInt],
-    ['smallmoney', sql.SmallMoney],
-    ['text', sql.Text],
-    ['time', sql.Time],
-    ['tinyint', sql.TinyInt],
-    ['tvp', sql.TVP],
-    ['uniqueidentifier', sql.UniqueIdentifier],
-    ['varbinary', sql.VarBinary],
-    ['varchar', sql.VarChar],
-    ['variant', sql.Variant],
-    ['xml', sql.Xml],
-    // Common variations
-    ['string', sql.NVarChar],
-    ['number', sql.Int],
-    ['boolean', sql.Bit],
-  ]);
+  // Allowed databases: comparison key -> the name as spelled in the allow-list, without delimiters
+  private readonly allowedDatabaseNames: ReadonlyMap<string, string>;
+  // Allowed databases as spelled in the allow-list, without delimiters, for the query validator
+  private readonly validatorAllowedDatabases: string[];
+  // Allowed procedures as lower-cased `schema.proc` keys
+  private readonly allowedProcedureKeys: ReadonlySet<string>;
+  private readonly defaultDatabase: string;
+  private readonly defaultKey: string;
+  private readonly maxRows: number;
+  /** Whether datetimeoffset values keep their original offset or are rendered in UTC. */
+  public readonly dateTimeOffsetMode: DateTimeOffsetMode;
 
   constructor(sqlConfig: SqlConfig, logger: Logger) {
     this.sqlConfig = sqlConfig;
     this.logger = logger;
-    // Pre-normalize allowedDatabases once at construction
-    this.normalizedAllowedDatabases = (sqlConfig.allowedDatabases || [])
-      .map(db => db.trim().toLowerCase())
-      .filter(Boolean);
+    const allowedDatabaseNames = new Map<string, string>();
+    for (const entry of sqlConfig.allowedDatabases || []) {
+      const name = normalizeDatabaseName(entry);
+      const key = name.toLowerCase();
+      if (key && !allowedDatabaseNames.has(key)) allowedDatabaseNames.set(key, name);
+    }
+    this.allowedDatabaseNames = allowedDatabaseNames;
+    this.validatorAllowedDatabases = [...allowedDatabaseNames.values()];
+    this.allowedProcedureKeys = buildAllowedProcedureSet(sqlConfig.allowedProcedures || [], (entry, reason) => {
+      this.logger.warn(
+        { entry, reason },
+        reason === 'unqualified'
+          ? 'DatabaseService: Ignoring SQL_ALLOWED_PROCEDURES entry without a schema; write it as schema.procedure.'
+          : 'DatabaseService: Ignoring invalid SQL_ALLOWED_PROCEDURES entry; use schema.procedure with letters, digits and underscores.'
+      );
+    });
+    this.defaultDatabase = normalizeDatabaseName(sqlConfig.database);
+    this.defaultKey = this.defaultDatabase.toLowerCase();
+    const configuredMaxRows = sqlConfig.maxRows;
+    this.maxRows = configuredMaxRows !== undefined && Number.isFinite(configuredMaxRows) && configuredMaxRows >= 1
+      ? Math.floor(configuredMaxRows)
+      : DEFAULT_MAX_ROWS;
+    const datetimeoffset = installDateTimeOffsetPatch();
+    this.dateTimeOffsetMode = datetimeoffset.mode;
+    if (datetimeoffset.firstAttempt && datetimeoffset.reason !== undefined) {
+      this.logger.warn(
+        { reason: datetimeoffset.reason },
+        'DatabaseService: Could not patch the driver to keep datetimeoffset offsets; datetimeoffset values are returned in UTC (+00:00).'
+      );
+    }
+    this.logger.debug({ datetimeoffsetMode: datetimeoffset.mode }, 'DatabaseService: datetimeoffset rendering mode.');
     this.logger.info('DatabaseService instantiated.');
   }
 
+  /** Number of valid entries in the stored procedure allow-list. */
+  public get allowedProcedureCount(): number {
+    return this.allowedProcedureKeys.size;
+  }
+
+  /** The row cap applied to every result set. */
+  public get maxRowsPerRecordset(): number {
+    return this.maxRows;
+  }
+
   /**
-   * Check if the target database is allowed by the whitelist (case-insensitive, trimmed).
-   * Throws PERMISSION_ERROR if not allowed.
+   * Checks the target database against the allow-list. Names are compared after
+   * `normalizeDatabaseName`, case-insensitively. Throws PERMISSION_ERROR if not allowed.
    */
   private assertDatabaseAllowed(targetDatabase: string, operation: string): void {
-    if (this.normalizedAllowedDatabases.length > 0 && !this.normalizedAllowedDatabases.includes(targetDatabase.toLowerCase().trim())) {
-      this.logger.warn(
-        { database: targetDatabase, allowed: this.sqlConfig.allowedDatabases },
-        `DatabaseService: Access to database '${targetDatabase}' is not allowed for ${operation}.`
-      );
+    if (this.allowedDatabaseNames.size > 0 && !this.allowedDatabaseNames.has(databaseNameKey(targetDatabase))) {
+      this.logger.debug({ database: targetDatabase, operation }, 'DatabaseService: Database is not in the whitelist.');
+      const allowed = [...this.allowedDatabaseNames.values()];
       throw new MssqlMcpError(
-        `Access to database '${targetDatabase}' is not allowed. Allowed databases: ${(this.sqlConfig.allowedDatabases || []).join(', ')}`,
+        `Database '${targetDatabase}' is not on this server's list of allowed databases, or it does not exist. Allowed databases: ${allowed.join(', ')}`,
         ErrorType.PERMISSION_ERROR,
         undefined,
-        { database: targetDatabase, allowed: this.sqlConfig.allowedDatabases }
+        { database: targetDatabase, allowed }
       );
     }
   }
 
   /**
-   * Validate a database name for safe use in identifiers.
+   * Validates an undelimited database name: letters, digits, underscores, hyphens and spaces.
    */
   private assertValidDatabaseName(dbName: string): void {
-    if (!/^[a-zA-Z0-9_\-\s\[\]]+$/.test(dbName)) {
+    if (!/^[a-zA-Z0-9_\-\s]+$/.test(dbName)) {
       throw new MssqlMcpError(
         `DatabaseService: Invalid database name format: ${dbName}`,
         ErrorType.VALIDATION_ERROR,
@@ -241,587 +220,484 @@ export class DatabaseService {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Connection pools: one per database, created on first use
+  // ---------------------------------------------------------------------------
+
   /**
-   * Sanitize a database name for use inside square-bracket identifiers.
+   * Maps a caller's database name to its pool key and the name the pool connects with. The
+   * default database connects as configured in SQL_DATABASE; with an allow-list, other
+   * databases connect as spelled in the allow-list, never as spelled by the caller.
    */
-  private sanitizeDbName(dbName: string): string {
-    return dbName.replace(/\]/g, '').replace(/\[/g, '');
+  private resolvePoolTarget(database: string): { key: string; database: string } {
+    const key = databaseNameKey(database);
+    if (key === this.defaultKey) return { key, database: this.defaultDatabase };
+    const allowedName = this.allowedDatabaseNames.get(key);
+    if (allowedName === undefined && this.allowedDatabaseNames.size > 0) this.assertDatabaseAllowed(database, 'connection');
+    const name = allowedName ?? normalizeDatabaseName(database);
+    this.assertValidDatabaseName(name);
+    return { key, database: name };
   }
 
-  /**
-   * Open a dedicated (non-pooled) connection for a specific database.
-   * Used when the target database differs from the pool's default to avoid
-   * the race condition of issuing USE on a shared pool connection.
-   */
-  private async openDedicatedConnection(targetDatabase: string): Promise<sql.ConnectionPool> {
-    this.assertValidDatabaseName(targetDatabase);
-    const sanitized = this.sanitizeDbName(targetDatabase);
-    this.logger.info({ database: sanitized }, 'DatabaseService: Opening dedicated connection for cross-database operation.');
+  private entryFor(database: string): PoolEntry {
+    if (this.closed) {
+      throw new MssqlMcpError('The database service is shutting down.', ErrorType.CONNECTION_ERROR);
+    }
+    const target = this.resolvePoolTarget(database);
+    let entry = this.pools.get(target.key);
+    if (!entry) {
+      entry = { ...target, pool: null, connecting: null, active: 0, lastUsed: Date.now(), retired: false };
+      this.pools.set(target.key, entry);
+      this.ensureIdleSweep();
+    }
+    return entry;
+  }
 
-    const dedicatedPool = new sql.ConnectionPool({
-      ...this.sqlConfig,
-      database: sanitized,
-      // Dedicated connections use a minimal pool — one connection, short-lived
-      pool: { min: 0, max: 1, idleTimeoutMillis: 5000 },
+  /** Returns the entry's connected pool, joining a connection attempt already in progress. */
+  private connectEntry(entry: PoolEntry): Promise<sql.ConnectionPool> {
+    if (entry.pool && entry.pool.connected) return Promise.resolve(entry.pool);
+    if (entry.connecting) return entry.connecting;
+
+    if (entry.pool) {
+      const stale = entry.pool;
+      entry.pool = null;
+      this.logger.warn({ database: entry.database }, 'DatabaseService: Pool is no longer connected; replacing it.');
+      void this.closePoolQuietly(stale, entry.database);
+    }
+
+    const attempt = this.connectWithRetry(entry);
+    entry.connecting = attempt;
+    const clear = () => { if (entry.connecting === attempt) entry.connecting = null; };
+    // A failed attempt retires the entry, so the next call starts from a new one
+    attempt.then(clear, () => {
+      clear();
+      this.retireEntry(entry, 'connection failed');
     });
-
-    await dedicatedPool.connect();
-    return dedicatedPool;
+    return attempt;
   }
 
   /**
-   * Get a connection pool for the given target database.
-   * Returns the shared pool if targeting the default database, or opens a
-   * dedicated connection for cross-database operations.
-   * Callers MUST call `maybeCloseDedicated` on the returned pool when done.
+   * Connects a new pool for the entry, retrying with exponential backoff. Concurrent callers
+   * share one attempt through `entry.connecting`, so only one retry chain runs per database.
    */
-  private async getConnectionForDatabase(targetDatabase: string): Promise<sql.ConnectionPool> {
-    if (targetDatabase === this.sqlConfig.database) {
-      return this.getPool();
-    }
-    return this.openDedicatedConnection(targetDatabase);
-  }
-
-  /**
-   * Close a dedicated connection pool (no-op if it's the shared pool).
-   */
-  private async maybeCloseDedicated(pool: sql.ConnectionPool): Promise<void> {
-    if (pool !== this.pool) {
-      try {
-        await pool.close();
-      } catch (err) {
-        this.logger.error({ err }, 'DatabaseService: Error closing dedicated connection.');
-      }
-    }
-  }
-
-  /**
-   * Parse raw recordsets from mssql into our Recordset[] format.
-   */
-  private parseRecordsets(rawRecordsets: unknown): { recordsets: Recordset[]; totalRecordCount: number } {
-    const cast = rawRecordsets as Array<sql.IRecordSet<any>> | undefined;
-    const allRecordsets: Recordset[] = [];
-    let totalRecordCount = 0;
-
-    if (cast && cast.length > 0) {
-      for (const rs of cast) {
-        if (rs && rs.length > 0) {
-          allRecordsets.push({
-            columns: Object.keys(rs[0]),
-            rows: rs.map((row: any) => Object.values(row)),
-            recordCount: rs.length
-          });
-          totalRecordCount += rs.length;
-        } else if (rs) {
-          let columnNames: string[] = [];
-          if ((rs as any).columns) {
-            const colArray = Object.values((rs as any).columns) as Array<{ index: number; name: string }>;
-            colArray.sort((a, b) => a.index - b.index);
-            columnNames = colArray.map(c => c.name);
-          }
-          allRecordsets.push({ columns: columnNames, rows: [], recordCount: 0 });
-        }
-      }
-    }
-
-    return { recordsets: allRecordsets, totalRecordCount };
-  }
-
-  /**
-   * Shared error handler for operation catch blocks.
-   * Classifies the error, attempts pool reconnection on connection errors, and throws MssqlMcpError.
-   */
-  private async handleOperationError(
-    error: unknown,
-    operation: string,
-    defaultErrorType: ErrorType,
-    context: Record<string, any>
-  ): Promise<never> {
-    this.logger.error({ err: error, ...context }, `DatabaseService: ${operation} error`);
-
-    if (error instanceof MssqlMcpError) {
-      throw error;
-    }
-
-    if (error instanceof Error) {
-      let errorType = defaultErrorType;
-      const msg = error.message.toLowerCase();
-
-      if (msg.includes('invalid sql syntax')) errorType = ErrorType.SQL_PARSER_ERROR;
-      else if (msg.includes('permission')) errorType = ErrorType.PERMISSION_ERROR;
-      else if (msg.includes('constraint')) errorType = ErrorType.VALIDATION_ERROR;
-      else if (msg.includes('timeout')) errorType = ErrorType.CONNECTION_TIMEOUT;
-      else if (msg.includes('connect') || msg.includes('failed to connect') || (error as any).code === 'ESOCKET') {
-        errorType = ErrorType.CONNECTION_ERROR;
-        this.logger.warn({ ...context, originalError: error.message }, `DatabaseService: Connection error during ${operation}. Attempting to re-establish pool.`);
-        await this.closePool();
-        try {
-          await this.getPool();
-          this.logger.info(context, `DatabaseService: Pool re-established after connection error during ${operation}.`);
-        } catch (reconnectError: unknown) {
-          this.logger.error({ err: reconnectError, ...context, originalError: error.message }, `DatabaseService: Failed to re-establish pool after ${operation} connection error.`);
-          throw new MssqlMcpError(
-            `Operation '${operation}' failed due to a connection error, and reconnection also failed.`,
-            ErrorType.CONNECTION_ERROR,
-            reconnectError instanceof Error ? reconnectError : new Error(String(reconnectError)),
-            { ...context, operation, originalErrorMsg: error.message }
-          );
-        }
-      }
-
-      throw MssqlMcpError.fromError(error, errorType, context);
-    }
-
-    throw MssqlMcpError.fromError(error, ErrorType.UNKNOWN_ERROR, context);
-  }
-
-  private mapStringToSqlType(typeName: string): sql.ISqlTypeFactoryWithNoParams | sql.ISqlTypeFactoryWithLength | sql.ISqlTypeFactoryWithPrecisionScale | sql.ISqlTypeFactoryWithScale | sql.ISqlTypeFactoryWithTvpType {
-    const normalizedTypeName = typeName.toLowerCase().trim();
-    const sqlTypeFactory = this.sqlDataTypeMap.get(normalizedTypeName);
-
-    if (!sqlTypeFactory) {
-      this.logger.warn({ typeName, normalizedTypeName }, `DatabaseService: SQL data type '${typeName}' is not explicitly mapped. Defaulting to NVarChar.`);
-      return sql.NVarChar;
-    }
-    return sqlTypeFactory;
-  }
-
-  public async closePool(): Promise<void> {
-    if (this.pool) {
-      try {
-        await this.pool.close();
-        this.logger.info('DatabaseService: SQL connection pool closed.');
-      } catch (err) {
-        this.logger.error({ err }, 'DatabaseService: Error closing SQL connection pool.');
-      } finally {
-        this.pool = null;
-        this.connectionPromise = null;
-      }
-    }
-  }
-
-  private async initPool(timeoutMs?: number): Promise<sql.ConnectionPool> {
-    // If a connection attempt is already in progress, return the existing promise.
-    if (this.connectionPromise) {
-      this.logger.info('DatabaseService: Connection attempt already in progress, returning existing promise.');
-      return this.connectionPromise;
-    }
-
-    // If there's an existing, connected, and healthy pool, reuse it.
-    if (this.pool && this.pool.connected) {
-      try {
-        await this.pool.request().query('SELECT 1 AS test_connection');
-        this.logger.info('DatabaseService: Reusing existing and connected pool.');
-        return this.pool;
-      } catch (e) {
-        this.logger.warn({ err: e }, 'DatabaseService: Existing pool failed test, re-initializing.');
-        await this.closePool();
-      }
-    }
-
+  private async connectWithRetry(entry: PoolEntry): Promise<sql.ConnectionPool> {
     if (!this.sqlConfig.password) {
       this.logger.error('DatabaseService: SQL Server password not provided. Set SQL_PASSWORD environment variable.');
       throw new MssqlMcpError('SQL Server password not provided.', ErrorType.VALIDATION_ERROR, undefined, { missingVariable: 'SQL_PASSWORD' });
     }
 
-    this.connectionPromise = (async () => {
-      let poolInstance: sql.ConnectionPool | null = null;
+    const attempts = Math.max(1, Math.floor(this.sqlConfig.maxRetries) || 1);
+    let lastError: unknown;
+    // SQL Server error numbers sent while logging in for the attempt that raised `lastError`;
+    // the driver's login error itself does not carry them
+    let lastLoginErrorNumbers: number[] = [];
+
+    for (let attempt = 0; attempt < attempts && !entry.retired; attempt++) {
+      const attemptLoginErrors: number[] = [];
+      const pool = new sql.ConnectionPool({
+        ...this.sqlConfig,
+        database: entry.database,
+        requestTimeout: this.sqlConfig.requestTimeout || 30000,
+        connectionTimeout: this.sqlConfig.connectionTimeout || 30000,
+        // Date/time values are built from UTC fields so they render without the process time zone
+        options: { ...this.sqlConfig.options, useUTC: true },
+        beforeConnect: (connection) => {
+          const onErrorMessage = (token: { number?: unknown }) => {
+            if (typeof token.number === 'number') attemptLoginErrors.push(token.number);
+          };
+          connection.on('errorMessage', onErrorMessage);
+          connection.once('connect', () => connection.removeListener('errorMessage', onErrorMessage));
+        },
+      });
+      pool.on('error', (err: Error) => {
+        this.logger.error({ err, database: entry.database }, 'DatabaseService: SQL pool reported an error.');
+      });
+
       try {
-        this.logger.info({ server: this.sqlConfig.server, port: this.sqlConfig.port, user: this.sqlConfig.user }, 'DatabaseService: Creating new SQL connection pool.');
-
-        poolInstance = new sql.ConnectionPool({
-          ...this.sqlConfig,
-          requestTimeout: timeoutMs || this.sqlConfig.requestTimeout || 30000,
-          connectionTimeout: timeoutMs || this.sqlConfig.connectionTimeout || 30000,
-        });
-
-        poolInstance.on('error', async (err: Error) => {
-          this.logger.error({ err }, 'DatabaseService: SQL pool instance error.');
-          if (this.pool === poolInstance) {
-            await this.closePool();
-          } else if (poolInstance) {
-            poolInstance.close().catch(closeErr => this.logger.error({ err: closeErr }, 'DatabaseService: Error closing errored non-active pool instance.'));
-          }
-        });
-
-        // Connect with timeout
-        const connectTimeout = this.sqlConfig.connectionTimeout || 30000;
-        const connectOperation = poolInstance.connect();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new MssqlMcpError(`DatabaseService: Connection attempt timed out after ${connectTimeout}ms`, ErrorType.CONNECTION_TIMEOUT)), connectTimeout);
-        });
-
-        try {
-          const connectedPool = await Promise.race([connectOperation, timeoutPromise]) as sql.ConnectionPool;
-          this.pool = connectedPool;
-        } catch (err: unknown) {
-          if (poolInstance && typeof poolInstance.close === 'function' && poolInstance !== this.pool) {
-            poolInstance.close().catch(closeErr => this.logger.error({ err: closeErr }, 'DatabaseService: Error closing pool instance on timeout/connect error.'));
-          }
-          if (err instanceof MssqlMcpError) throw err;
-          throw MssqlMcpError.fromError(err, ErrorType.CONNECTION_ERROR, { customMessage: 'DatabaseService: Failed to connect to SQL Server.' });
-        } finally {
-          if (timer) clearTimeout(timer);
-        }
-
-        if (!this.pool) {
-          throw MssqlMcpError.fromError('DatabaseService: Pool was not assigned after connect.', ErrorType.UNKNOWN_ERROR, { function: 'initPool' });
-        }
-
-        this.logger.info('DatabaseService: SQL connection pool connected successfully.');
-        this.connectionRetries = 0;
-        return this.pool;
+        this.logger.info(
+          { server: this.sqlConfig.server, port: this.sqlConfig.port, database: entry.database, attempt: attempt + 1, attempts },
+          'DatabaseService: Connecting pool.'
+        );
+        await pool.connect();
       } catch (error: unknown) {
-        this.logger.error({ err: error }, 'DatabaseService: SQL Server connection error.');
-
-        if (poolInstance && poolInstance !== this.pool) {
-          try {
-            await poolInstance.close();
-            this.logger.info('DatabaseService: Cleaned up intermediate poolInstance after error.');
-          } catch (closeError) {
-            this.logger.error({ err: closeError }, 'DatabaseService: Error closing intermediate poolInstance after connection error.');
-          }
-        }
-
-        if (this.pool) {
-          await this.closePool();
-        } else {
-          this.connectionPromise = null;
-        }
-
-        if (error instanceof MssqlMcpError) throw error;
-        throw MssqlMcpError.fromError(error, ErrorType.CONNECTION_ERROR, { customMessage: 'DatabaseService: SQL Server connection failed.' });
-      } finally {
-        // Nullify connectionPromise once settled so future callers don't re-await a stale promise
-        if (this.pool !== poolInstance) {
-          this.connectionPromise = null;
-        }
-      }
-    })();
-    return this.connectionPromise;
-  }
-
-  public async getPool(currentAttempt = 0): Promise<sql.ConnectionPool> {
-    if (this.pool && this.pool.connected) {
-      return this.pool;
-    }
-
-    // If a connection is actively being established by another call, wait for it.
-    if (this.isConnecting && this.connectionPromise) {
-      this.logger.info('[DatabaseService] getPool: Connection attempt already in progress, awaiting existing promise.');
-      try {
-        const poolFromPromise = await this.connectionPromise;
-        if (this.pool && this.pool.connected && this.pool === poolFromPromise) {
-          return this.pool;
-        }
-        this.logger.warn('[DatabaseService] getPool: Watched connectionPromise resolved but pool state is unexpected. Retrying.');
-      } catch (error) {
-        this.logger.warn({ err: error }, '[DatabaseService] getPool: Watched connectionPromise failed. Retrying.');
-        this.isConnecting = false;
-      }
-    }
-
-    if (this.isConnecting) {
-      this.logger.info('[DatabaseService] getPool: isConnecting is true but no active promise, brief wait and retry.');
-      await new Promise(resolve => setTimeout(resolve, this.sqlConfig.initialRetryDelay / 2 || 500));
-      return this.getPool(currentAttempt);
-    }
-
-    this.isConnecting = true;
-
-    this.logger.info({ attempt: currentAttempt + 1, maxRetries: this.sqlConfig.maxRetries }, `[DatabaseService] getPool: Attempting to establish connection (Attempt ${currentAttempt + 1}).`);
-
-    try {
-      await this.initPool();
-
-      if (!this.pool || !this.pool.connected) {
-        throw MssqlMcpError.fromError('DatabaseService: Pool not connected after initPool resolved without error.', ErrorType.CONNECTION_ERROR);
-      }
-
-      this.logger.info('[DatabaseService] getPool: Successfully connected and pool is initialized.');
-      this.isConnecting = false;
-      this.connectionRetries = 0;
-      return this.pool;
-    } catch (error: unknown) {
-      this.isConnecting = false;
-
-      const mssqlError = MssqlMcpError.fromError(error, ErrorType.CONNECTION_ERROR);
-      this.logger.error(
-        { err: mssqlError, attempt: currentAttempt + 1 },
-        `[DatabaseService] getPool: Error establishing connection pool (Attempt ${currentAttempt + 1})`
-      );
-
-      // maxRetries means total attempts (not retries-after-first)
-      if (currentAttempt + 1 < this.sqlConfig.maxRetries) {
+        lastError = error;
+        lastLoginErrorNumbers = attemptLoginErrors;
+        await this.closePoolQuietly(pool, entry.database);
+        this.logger.warn({ err: error, database: entry.database, attempt: attempt + 1, attempts }, 'DatabaseService: Connection attempt failed.');
+        // A rejected login does not succeed on retry
+        if (errorCode(error) === 'ELOGIN' || attempt + 1 >= attempts) break;
         const delay = Math.min(
-          this.sqlConfig.initialRetryDelay * Math.pow(2, currentAttempt) + Math.random() * 1000,
+          this.sqlConfig.initialRetryDelay * Math.pow(2, attempt) + Math.random() * 1000,
           this.sqlConfig.maxRetryDelay
         );
-        this.logger.info({ delayMs: delay }, '[DatabaseService] getPool: Retrying connection...');
-        await new Promise(resolve => setTimeout(resolve, delay));
-        return this.getPool(currentAttempt + 1);
-      } else {
-        this.logger.error({ attempts: this.sqlConfig.maxRetries }, '[DatabaseService] getPool: Max connection attempts reached.');
-        throw new MssqlMcpError(
-          `DatabaseService: Failed to connect to database after ${this.sqlConfig.maxRetries} attempts. Last error: ${mssqlError.message}`,
-          ErrorType.CONNECTION_ERROR,
-          mssqlError.originalError,
-          { attempts: this.sqlConfig.maxRetries, ...mssqlError.details }
-        );
+        await sleep(delay);
+        continue;
+      }
+
+      if (entry.retired) {
+        await this.closePoolQuietly(pool, entry.database);
+        break;
+      }
+      entry.pool = pool;
+      this.logger.info({ database: entry.database }, 'DatabaseService: Pool connected.');
+      return pool;
+    }
+
+    if (lastError === undefined) {
+      throw new MssqlMcpError(`The connection pool for database '${entry.database}' was closed.`, ErrorType.CONNECTION_ERROR, undefined, { database: entry.database });
+    }
+    const wrapped = toMssqlMcpError(lastError, ErrorType.CONNECTION_ERROR, { database: entry.database });
+    const cannotOpenDatabase =
+      wrapped.sqlErrorNumber === SQL_ERROR_CANNOT_OPEN_DATABASE ||
+      (wrapped.sqlErrorNumber === undefined && lastLoginErrorNumbers.includes(SQL_ERROR_CANNOT_OPEN_DATABASE));
+    if (cannotOpenDatabase) {
+      throw new MssqlMcpError(
+        `Cannot open database '${entry.database}': it does not exist, or the login cannot access it.`,
+        wrapped.errorType,
+        wrapped.originalError,
+        { database: entry.database, attempts },
+        { code: wrapped.code, sqlErrorNumber: SQL_ERROR_CANNOT_OPEN_DATABASE }
+      );
+    }
+    throw new MssqlMcpError(
+      `Failed to connect to SQL Server database '${entry.database}': ${wrapped.message}`,
+      wrapped.errorType,
+      wrapped.originalError,
+      { database: entry.database, attempts },
+      { code: wrapped.code, sqlErrorNumber: wrapped.sqlErrorNumber }
+    );
+  }
+
+  /**
+   * Runs `fn` with the database's pool. A pool whose connection was lost is retired, so the
+   * next call builds a new one. The failed operation itself is not retried.
+   */
+  private async withPool<T>(database: string, fn: (pool: sql.ConnectionPool, entry: PoolEntry) => Promise<T>): Promise<T> {
+    const entry = this.entryFor(database);
+    entry.active++;
+    let pool: sql.ConnectionPool | null = null;
+    try {
+      pool = await this.connectEntry(entry);
+      return await fn(pool, entry);
+    } catch (error: unknown) {
+      if (pool && (classifyError(error, ErrorType.UNKNOWN_ERROR).connectionLost || !pool.connected)) {
+        this.retireEntry(entry, 'connection lost');
+      }
+      throw error;
+    } finally {
+      entry.active--;
+      entry.lastUsed = Date.now();
+      if (entry.retired && entry.active === 0) this.closeRetiredEntry(entry);
+    }
+  }
+
+  /** Stops handing out the entry's pool; it is closed as soon as no operation uses it. */
+  private retireEntry(entry: PoolEntry, reason: string): void {
+    if (entry.retired) return;
+    entry.retired = true;
+    if (this.pools.get(entry.key) === entry) this.pools.delete(entry.key);
+    this.logger.info({ database: entry.database, reason }, 'DatabaseService: Retiring connection pool.');
+    if (entry.active === 0) this.closeRetiredEntry(entry);
+  }
+
+  private closeRetiredEntry(entry: PoolEntry): void {
+    const pool = entry.pool;
+    entry.pool = null;
+    if (pool) void this.closePoolQuietly(pool, entry.database);
+  }
+
+  private async closePoolQuietly(pool: sql.ConnectionPool, database: string): Promise<void> {
+    try {
+      await pool.close();
+    } catch (err: unknown) {
+      this.logger.warn({ err, database }, 'DatabaseService: Error closing connection pool.');
+    }
+  }
+
+  private ensureIdleSweep(): void {
+    if (this.sweepTimer || this.closed) return;
+    this.sweepTimer = setInterval(() => this.sweepIdlePools(), POOL_SWEEP_INTERVAL_MS);
+    this.sweepTimer.unref?.();
+  }
+
+  private sweepIdlePools(): void {
+    const now = Date.now();
+    for (const entry of [...this.pools.values()]) {
+      if (entry.key !== this.defaultKey && entry.active === 0 && !entry.connecting && now - entry.lastUsed > POOL_IDLE_TTL_MS) {
+        this.retireEntry(entry, 'idle');
       }
     }
   }
+
+  /** Connects the default database's pool, logging instead of throwing on failure. */
+  public async warmUp(): Promise<void> {
+    try {
+      await this.withPool(this.sqlConfig.database, async () => undefined);
+      this.logger.info({ database: this.sqlConfig.database }, 'DatabaseService: Default connection pool is ready.');
+    } catch (err: unknown) {
+      this.logger.warn(
+        { err, database: this.sqlConfig.database },
+        'DatabaseService: Could not connect to the default database; tool calls will connect on demand.'
+      );
+    }
+  }
+
+  /** Closes every pool. Later operations fail with a connection error. */
+  public async closeAll(): Promise<void> {
+    this.closed = true;
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+    const entries = [...this.pools.values()];
+    this.pools.clear();
+    await Promise.all(entries.map(async (entry) => {
+      entry.retired = true;
+      const pool = entry.pool;
+      entry.pool = null;
+      if (pool) await this.closePoolQuietly(pool, entry.database);
+    }));
+    this.logger.info('DatabaseService: All connection pools closed.');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rollback-only transactions and streaming
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Run `work` inside a transaction that is always rolled back, whether `work` succeeds,
+   * fails with a SQL error, throws, or is cancelled. `work` must not settle while its request
+   * is still running, so the rollback never meets a request in progress. If the rollback
+   * fails in a way that may leave the transaction open, the connection is closed (which
+   * makes SQL Server roll it back) and the pool is retired so the connection is not reused.
+   * Rollback failures are logged and never replace the error raised by `work`.
+   */
+  private async runInRollbackOnlyTransaction<T>(
+    pool: sql.ConnectionPool,
+    entry: PoolEntry,
+    operation: string,
+    signal: AbortSignal | undefined,
+    work: (request: sql.Request) => Promise<T>
+  ): Promise<T> {
+    const transaction = new sql.Transaction(pool);
+    try {
+      await transaction.begin();
+      throwIfAborted(signal);
+      return await work(new sql.Request(transaction));
+    } finally {
+      const outcome = await this.rollbackQuietly(transaction, operation);
+      if (outcome === 'unsafe') this.retireEntry(entry, 'rollback failed');
+    }
+  }
+
+  /**
+   * Roll back `transaction`, logging instead of throwing on failure.
+   * - EABORT: SQL Server already rolled the transaction back (e.g. after a severe or
+   *   XACT_ABORT error) and the driver has already released the connection.
+   * - ENOTBEGUN: begin() failed before a connection was acquired; nothing to undo.
+   * - Error 3903 (no corresponding BEGIN TRANSACTION): the batch itself ended the
+   *   transaction. The driver still releases the connection, which has no open
+   *   transaction left.
+   * - Anything else: the transaction may still be open, so the connection is closed.
+   */
+  private async rollbackQuietly(transaction: sql.Transaction, operation: string): Promise<RollbackOutcome> {
+    const held = (transaction as unknown as { _acquiredConnection?: HeldConnection | null })._acquiredConnection ?? null;
+    try {
+      await transaction.rollback();
+      return 'rolled-back';
+    } catch (rollbackError: unknown) {
+      const code = (rollbackError as { code?: unknown } | null)?.code;
+      const noBeginTran = extractDriverErrorInfo(rollbackError).sqlErrorNumber === SQL_ERROR_NO_CORRESPONDING_BEGIN_TRAN;
+
+      if (code === 'EABORT' || code === 'ENOTBEGUN') {
+        this.logger.debug({ code, operation }, 'DatabaseService: Transaction was already ended before rollback.');
+        return 'already-ended';
+      }
+      if (noBeginTran) {
+        this.logger.warn({ code, operation }, 'DatabaseService: Transaction was ended by the batch before rollback.');
+        return 'already-ended';
+      }
+
+      this.logger.error({ err: rollbackError, operation }, 'DatabaseService: Rollback of read-only transaction failed; closing its connection.');
+      if (held && typeof held.close === 'function') {
+        try {
+          held.close();
+        } catch (closeError: unknown) {
+          this.logger.warn({ err: closeError, operation }, 'DatabaseService: Error closing connection after failed rollback.');
+        }
+      }
+      return 'unsafe';
+    }
+  }
+
+  /**
+   * Runs a request in stream mode with rows as arrays, feeding the pager. When
+   * `stopWhenPageFull` is set, the request is cancelled as soon as the pager has seen the
+   * first row past the page. Aborting `signal` cancels the request. Settles only after the
+   * driver reports the request done, by which point it has released the connection back
+   * to the transaction.
+   */
+  private async runStreamingRequest(
+    request: sql.Request,
+    pager: RecordsetPager,
+    start: (request: sql.Request) => Promise<unknown>,
+    options: { stopWhenPageFull: boolean; signal?: AbortSignal }
+  ): Promise<StreamOutcome> {
+    const { stopWhenPageFull, signal } = options;
+    request.stream = true;
+    request.arrayRowMode = true;
+
+    let pageFull = false;
+    let abortedByClient = false;
+    const errors: unknown[] = [];
+    let done: { output?: Record<string, unknown>; returnValue?: unknown; rowsAffected?: number[] } | undefined;
+
+    request.on('recordset', (columns: unknown) => pager.startRecordset(columns));
+    request.on('row', (row: unknown) => {
+      if (pageFull || abortedByClient) return;
+      if (pager.addRow(row) && stopWhenPageFull) {
+        pageFull = true;
+        request.cancel();
+      }
+    });
+    request.on('error', (err: unknown) => errors.push(err));
+    request.on('done', (result: typeof done) => { done = result; });
+
+    const onAbort = () => {
+      abortedByClient = true;
+      request.cancel();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+
+    try {
+      // In stream mode this settles after the driver's 'done' event
+      await start(request);
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+    }
+
+    if (abortedByClient) throw cancelledError();
+    const failure = errors.find((err) => !(pageFull && errorCode(err) === 'ECANCEL'));
+    if (failure !== undefined) throw failure;
+
+    return {
+      output: done?.output ?? {},
+      returnValue: done?.returnValue,
+      rowsAffected: done?.rowsAffected ?? [],
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Operations
+  // ---------------------------------------------------------------------------
 
   public async getSchema(dbIdentifier: string): Promise<TableSchema[]> {
     this.assertDatabaseAllowed(dbIdentifier, 'schema retrieval');
 
-    this.logger.info({ database: dbIdentifier }, `DatabaseService: Fetching schema for database: ${dbIdentifier}`);
-
-    // Check cache first
-    const cachedSchema = this.schemaCache.get(dbIdentifier);
+    const cacheKey = databaseNameKey(dbIdentifier);
+    const cachedSchema = this.schemaCache.get(cacheKey);
     if (cachedSchema && (Date.now() - cachedSchema.timestamp < this.sqlConfig.schemaCacheTTL)) {
-      this.logger.info({ database: dbIdentifier }, 'DatabaseService: Returning cached schema.');
+      this.logger.debug({ database: dbIdentifier }, 'DatabaseService: Returning cached schema.');
       return cachedSchema.data;
     }
-    this.logger.info({ database: dbIdentifier }, 'DatabaseService: No valid cache found, fetching from DB.');
-
-    const dbPool = await this.getConnectionForDatabase(dbIdentifier);
 
     try {
-      const schemaResult = await dbPool.request().query<SchemaQueryRow>(`
-        SELECT 
-            t.TABLE_SCHEMA, 
-            t.TABLE_NAME,
-            c.COLUMN_NAME, 
-            c.DATA_TYPE,
-            c.CHARACTER_MAXIMUM_LENGTH,
-            c.NUMERIC_PRECISION,
-            c.NUMERIC_SCALE,
-            c.IS_NULLABLE,
-            CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS IS_PRIMARY_KEY,
-            c.ORDINAL_POSITION
-        FROM 
-            INFORMATION_SCHEMA.TABLES t
-        INNER JOIN 
-            INFORMATION_SCHEMA.COLUMNS c ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME
-        LEFT JOIN (
-            SELECT 
-                ku.TABLE_SCHEMA,
-                ku.TABLE_NAME,
-                ku.COLUMN_NAME
-            FROM 
-                INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
-            INNER JOIN 
-                INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku 
-                ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
-                AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
-        ) pk ON c.TABLE_SCHEMA = pk.TABLE_SCHEMA AND c.TABLE_NAME = pk.TABLE_NAME AND c.COLUMN_NAME = pk.COLUMN_NAME
-        WHERE 
-            t.TABLE_TYPE = 'BASE TABLE'
-        ORDER BY 
-            t.TABLE_SCHEMA, t.TABLE_NAME, c.ORDINAL_POSITION;
-      `);
-
-      const tablesMap: Map<string, TableSchema> = new Map();
-
-      for (const row of schemaResult.recordset) {
-        const tableName = `${row.TABLE_SCHEMA}.${row.TABLE_NAME}`;
-        if (!tablesMap.has(tableName)) {
-          tablesMap.set(tableName, {
-            schema: row.TABLE_SCHEMA,
-            name: row.TABLE_NAME,
-            fullName: tableName,
-            columns: []
-          });
-        }
-
-        let columnType = row.DATA_TYPE;
-        if (row.CHARACTER_MAXIMUM_LENGTH) {
-          columnType += `(${row.CHARACTER_MAXIMUM_LENGTH})`;
-        } else if (row.NUMERIC_PRECISION !== null && row.NUMERIC_SCALE !== null) {
-          columnType += `(${row.NUMERIC_PRECISION},${row.NUMERIC_SCALE})`;
-        }
-
-        tablesMap.get(tableName)!.columns.push({
-          name: row.COLUMN_NAME,
-          type: columnType,
-          nullable: row.IS_NULLABLE === 'YES',
-          primary: row.IS_PRIMARY_KEY === 1
-        });
-      }
-
-      const tables: TableSchema[] = Array.from(tablesMap.values());
-
-      this.schemaCache.set(dbIdentifier, { timestamp: Date.now(), data: tables });
-      this.logger.info({ database: dbIdentifier }, 'DatabaseService: Schema cached.');
-
+      // Catalog-only SELECTs generated here; they need no transaction
+      const tables = await this.withPool(dbIdentifier, async (pool) => {
+        const result = await pool.request().query(SCHEMA_QUERY);
+        const sets = result.recordsets as unknown as [SchemaColumnRow[]?, ForeignKeyRow[]?];
+        return buildTableSchemas(sets[0] ?? [], sets[1] ?? []);
+      });
+      this.schemaCache.set(cacheKey, { timestamp: Date.now(), data: tables });
       return tables;
     } catch (error: unknown) {
-      return await this.handleOperationError(error, 'getSchema', ErrorType.SCHEMA_ERROR, { database: dbIdentifier });
-    } finally {
-      await this.maybeCloseDedicated(dbPool);
+      throw toMssqlMcpError(error, ErrorType.SCHEMA_ERROR, { database: dbIdentifier });
     }
   }
 
-  public async executeQuery(query: string, rawDatabaseArg?: string, offset?: number, limit?: number): Promise<QueryResult> {
+  public async executeQuery(
+    query: string,
+    rawDatabaseArg?: string,
+    offset?: number,
+    limit?: number,
+    options: OperationOptions = {}
+  ): Promise<QueryResult> {
     const targetDatabase = rawDatabaseArg || this.sqlConfig.database;
     this.assertDatabaseAllowed(targetDatabase, 'query execution');
-
-    this.logger.info({ database: targetDatabase }, 'DatabaseService: Executing query.');
 
     if (!query || query.trim() === '') {
       throw new MssqlMcpError('DatabaseService: Query cannot be empty', ErrorType.VALIDATION_ERROR, undefined, { query });
     }
 
-    // Parse and validate — SELECT only
-    const parser = new nodeParser.Parser();
-    let ast;
+    // Single read-only SELECT statement only; throws MssqlMcpError otherwise
+    validateReadOnlyQuery(query, { allowedDatabases: this.validatorAllowedDatabases });
+
+    const window = resolvePageWindow(offset, limit, this.maxRows);
+    const { signal } = options;
+
     try {
-      ast = parser.astify(query, { database: 'transactsql' });
-    } catch (parseError: unknown) {
-      this.logger.error({ err: parseError }, 'DatabaseService: SQL parsing error');
-      const originalError = parseError instanceof Error ? parseError : undefined;
-      const message = parseError instanceof Error ? parseError.message : String(parseError);
-      throw new MssqlMcpError(`DatabaseService: Invalid SQL syntax: ${message}`, ErrorType.SQL_PARSER_ERROR, originalError, { query: query.substring(0, 200) });
-    }
-
-    const queries = Array.isArray(ast) ? ast : [ast];
-    for (const q of queries) {
-      if (q.type !== 'select') {
-        throw new MssqlMcpError(
-          'DatabaseService: Only SELECT queries are allowed. DELETE, INSERT, UPDATE, and other DML/DDL operations are not permitted.',
-          ErrorType.VALIDATION_ERROR,
-          undefined,
-          { queryType: q.type }
-        );
-      }
-    }
-
-    // Defense-in-depth: word-boundary checks for dangerous keywords
-    // Uses \b to avoid false positives on column names like 'crisp_products' or 'exec_date'
-    const dangerousPatterns = /\b(exec\s|execute\s|reconfigure|waitfor\s+delay)\b/i;
-    if (dangerousPatterns.test(query)) {
-      throw new MssqlMcpError(
-        'DatabaseService: Potentially unsafe query detected. Use the execute_stored_procedure tool for stored procedures.',
-        ErrorType.VALIDATION_ERROR,
-        undefined,
-        { query: query.substring(0, 200) }
+      throwIfAborted(signal);
+      return await this.withPool(targetDatabase, (pool, entry) =>
+        this.runInRollbackOnlyTransaction(pool, entry, 'executeQuery', signal, async (request) => {
+          const pager = new RecordsetPager(window);
+          await this.runStreamingRequest(request, pager, (r) => r.query(query), { stopWhenPageFull: true, signal });
+          return buildQueryResult(pager, window);
+        })
       );
-    }
-
-    const dbPool = await this.getConnectionForDatabase(targetDatabase);
-
-    try {
-      const result = await dbPool.request().query(query);
-
-      const { recordsets, totalRecordCount } = this.parseRecordsets(result.recordsets);
-
-      // Apply pagination: offset skips rows, limit caps how many are returned
-      const effectiveLimit = limit ?? (this.sqlConfig.maxRows ?? DEFAULT_MAX_ROWS);
-      const effectiveOffset = offset ?? 0;
-
-      const paginatedRecordsets = recordsets.map(rs => {
-        const sliceStart = Math.min(effectiveOffset, rs.rows.length);
-        const sliceEnd = Math.min(sliceStart + effectiveLimit, rs.rows.length);
-        const slicedRows = rs.rows.slice(sliceStart, sliceEnd);
-        return { ...rs, rows: slicedRows, recordCount: slicedRows.length };
-      });
-
-      const returnedRows = paginatedRecordsets.reduce((sum, rs) => sum + rs.recordCount, 0);
-      const hasMore = totalRecordCount > effectiveOffset + effectiveLimit;
-
-      if (paginatedRecordsets.length > 0) {
-        return {
-          recordsets: paginatedRecordsets,
-          totalRecordCount,
-          pagination: {
-            offset: effectiveOffset,
-            limit: effectiveLimit,
-            hasMore,
-            ...(hasMore ? { nextOffset: effectiveOffset + effectiveLimit } : {}),
-            totalRowsFetched: returnedRows
-          }
-        };
-      } else {
-        return {
-          recordsets: [{ columns: [], rows: [], recordCount: 0 }],
-          totalRecordCount: 0
-        };
-      }
     } catch (error: unknown) {
-      return await this.handleOperationError(error, 'executeQuery', ErrorType.QUERY_ERROR, { query: query.length > 100 ? query.substring(0, 100) + '...' : query });
-    } finally {
-      await this.maybeCloseDedicated(dbPool);
+      throw toMssqlMcpError(error, ErrorType.QUERY_ERROR, { database: targetDatabase, query: querySnippet(query) });
     }
   }
 
-  public async executeStoredProcedure(procedure: string, parameters: Array<{ name: string; type: string; value?: any }> = [], rawDatabaseArg?: string): Promise<StoredProcedureResult> {
+  public async executeStoredProcedure(
+    procedure: string,
+    parameters: ProcedureParameterInput[] = [],
+    rawDatabaseArg?: string,
+    options: OperationOptions = {}
+  ): Promise<StoredProcedureResult> {
     const targetDatabase = rawDatabaseArg || this.sqlConfig.database;
     this.assertDatabaseAllowed(targetDatabase, 'stored procedure execution');
 
-    this.logger.info({ database: targetDatabase, procedure, parametersCount: parameters.length }, `DatabaseService: Executing stored procedure ${procedure}`);
+    const name = requireProcedureName(procedure);
 
-    if (!procedure || procedure.trim() === '') {
-      throw new MssqlMcpError('DatabaseService: Procedure name cannot be empty', ErrorType.VALIDATION_ERROR, undefined, { procedure });
-    }
-
-    if (!/^([a-zA-Z0-9_]+\.)?[a-zA-Z0-9_]+$/.test(procedure)) {
-      throw new MssqlMcpError('DatabaseService: Invalid procedure name format. Use [schema].[procedure_name]', ErrorType.VALIDATION_ERROR, undefined, { procedure });
-    }
-
-    // Check against deny-list of dangerous system procedures
-    const normalizedProcName = procedure.toLowerCase().split('.').pop()!;
-    if (DENIED_SYSTEM_PROCEDURES.has(normalizedProcName)) {
+    // Allow-list: only procedures named in SQL_ALLOWED_PROCEDURES may run
+    if (!this.allowedProcedureKeys.has(name.key)) {
       throw new MssqlMcpError(
-        `DatabaseService: Execution of system procedure '${procedure}' is not allowed.`,
+        `DatabaseService: Execution of stored procedure '${procedure}' is not allowed.`,
         ErrorType.PERMISSION_ERROR,
         undefined,
         { procedure }
       );
     }
 
-    const dbPool = await this.getConnectionForDatabase(targetDatabase);
+    const prepared = parameters.map(prepareProcedureParameter);
+    const { signal } = options;
 
     try {
-      const request = dbPool.request();
+      throwIfAborted(signal);
+      return await this.withPool(targetDatabase, (pool, entry) =>
+        this.runInRollbackOnlyTransaction(pool, entry, 'executeStoredProcedure', signal, async (request) => {
+          for (const param of prepared) {
+            if (param.direction === 'out') {
+              request.output(param.name, param.sqlType, param.value);
+            } else {
+              request.input(param.name, param.sqlType, param.value);
+            }
+          }
 
-      for (const param of parameters) {
-        if (!param.name || !param.type) {
-          throw new MssqlMcpError('DatabaseService: Each parameter must have a name and type', ErrorType.VALIDATION_ERROR, undefined, { parameter: param });
-        }
-
-        const paramName = param.name.startsWith('@') ? param.name : `@${param.name}`;
-        const sqlTypeFactory = this.mapStringToSqlType(param.type);
-        request.input(paramName.replace('@', ''), sqlTypeFactory, param.value);
-      }
-
-      const result = await request.execute(procedure);
-
-      const { recordsets, totalRecordCount } = this.parseRecordsets(result.recordsets);
-
-      if (recordsets.length > 0 && totalRecordCount > 0) {
-        return {
-          recordsets,
-          totalRecordCount,
-          outputParameters: result.output,
-          returnValue: result.returnValue,
-          rowsAffected: result.rowsAffected
-        };
-      } else {
-        return {
-          message: 'Stored procedure executed successfully, but returned no records',
-          outputParameters: result.output,
-          returnValue: result.returnValue,
-          rowsAffected: result.rowsAffected,
-          recordCount: 0
-        };
-      }
+          const pager = new RecordsetPager({ offset: 0, limit: this.maxRows }, false);
+          const outcome = await this.runStreamingRequest(request, pager, (r) => r.execute(name.canonical), { stopWhenPageFull: false, signal });
+          return {
+            recordsets: pager.recordsets(),
+            outputParameters: formatOutputParameters(outcome.output, prepared.filter((param) => param.direction === 'out')),
+            returnValue: outcome.returnValue,
+            rowsAffected: outcome.rowsAffected,
+          };
+        })
+      );
     } catch (error: unknown) {
-      return await this.handleOperationError(error, 'executeStoredProcedure', ErrorType.STORED_PROCEDURE_ERROR, { procedure });
-    } finally {
-      await this.maybeCloseDedicated(dbPool);
+      throw toMssqlMcpError(error, ErrorType.STORED_PROCEDURE_ERROR, { database: targetDatabase, procedure: name.canonical });
     }
   }
 }

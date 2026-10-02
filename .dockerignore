@@ -33,3 +33,10 @@ README.md
 FORGE.md
 *.zip
 *.md
+
+# Agent and scratch folders
+.claude
+.forge
+.velar
+tmp
+plans
