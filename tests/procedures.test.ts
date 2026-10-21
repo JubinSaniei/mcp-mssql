@@ -4,10 +4,12 @@ import { ErrorType, MssqlMcpError } from '../errors.js';
 import {
   SQL_PARAMETER_TYPES,
   buildAllowedProcedureSet,
+  isProcedureAllowed,
   parseProcedureName,
   prepareProcedureParameter,
   requireProcedureName,
   resolveSqlType,
+  wildcardEntries,
 } from '../procedures.js';
 
 function errorOf(fn: () => unknown): MssqlMcpError {
@@ -60,7 +62,64 @@ describe('buildAllowedProcedureSet', () => {
 
   it('matches requested names case-insensitively, with or without brackets', () => {
     const allowed = buildAllowedProcedureSet(['dbo.GetX']);
-    expect(allowed.has(requireProcedureName('[DBO].[getx]').key)).toBe(true);
+    expect(isProcedureAllowed(allowed, requireProcedureName('[DBO].[getx]'))).toBe(true);
+    expect(isProcedureAllowed(allowed, requireProcedureName('dbo.GetY'))).toBe(false);
+  });
+
+  it('accepts schema.* and [schema].* entries, which allow every procedure in that schema', () => {
+    const onIgnored = vi.fn();
+    const allowed = buildAllowedProcedureSet(['dbo.*', ' [Rpt].* '], onIgnored);
+    expect([...allowed]).toEqual(['dbo.*', 'rpt.*']);
+    expect(onIgnored).not.toHaveBeenCalled();
+    expect(isProcedureAllowed(allowed, requireProcedureName('dbo.GL_DistUpdate_UpdateDistributions_SP'))).toBe(true);
+    expect(isProcedureAllowed(allowed, requireProcedureName('[RPT].[Monthly]'))).toBe(true);
+    expect(isProcedureAllowed(allowed, requireProcedureName('sales.GetOrders'))).toBe(false);
+  });
+
+  it('accepts a bare * entry, which allows every schema-qualified procedure', () => {
+    const allowed = buildAllowedProcedureSet([' * ']);
+    expect([...allowed]).toEqual(['*']);
+    expect(isProcedureAllowed(allowed, requireProcedureName('dbo.GetX'))).toBe(true);
+    expect(isProcedureAllowed(allowed, requireProcedureName('sales.GetOrders'))).toBe(true);
+  });
+
+  it('keeps sys and INFORMATION_SCHEMA procedures out of a bare *', () => {
+    const allowed = buildAllowedProcedureSet(['*']);
+    for (const name of ['sys.sp_executesql', '[SYS].[xp_cmdshell]', 'INFORMATION_SCHEMA.p']) {
+      expect(isProcedureAllowed(allowed, requireProcedureName(name))).toBe(false);
+    }
+  });
+
+  it('allows sys procedures only through an exact entry or an explicit sys.*', () => {
+    const exact = buildAllowedProcedureSet(['*', 'sys.sp_who']);
+    expect(isProcedureAllowed(exact, requireProcedureName('sys.sp_who'))).toBe(true);
+    expect(isProcedureAllowed(exact, requireProcedureName('sys.sp_executesql'))).toBe(false);
+    expect(isProcedureAllowed(buildAllowedProcedureSet(['sys.*']), requireProcedureName('sys.sp_executesql'))).toBe(true);
+  });
+
+  it('accepts whitespace around the dot of a schema.* entry', () => {
+    expect([...buildAllowedProcedureSet(['dbo. *', 'rpt .*'])]).toEqual(['dbo.*', 'rpt.*']);
+  });
+
+  it('rejects other wildcard forms as invalid entries', () => {
+    const onIgnored = vi.fn();
+    const allowed = buildAllowedProcedureSet(['*.*', '*.p', 'dbo.[*]', 'dbo.Get*', '[*]', 'db.dbo.*', '**'], onIgnored);
+    expect(allowed.size).toBe(0);
+    expect(onIgnored).toHaveBeenCalledTimes(7);
+    for (const call of onIgnored.mock.calls) expect(call[1]).toBe('invalid');
+  });
+
+  it('lists the wildcard entries of an allow-list', () => {
+    expect(wildcardEntries(buildAllowedProcedureSet(['dbo.GetX']))).toEqual([]);
+    expect(wildcardEntries(buildAllowedProcedureSet(['dbo.GetX', 'Rpt.*', '*']))).toEqual(['rpt.*', '*']);
+  });
+});
+
+describe('requested procedure names', () => {
+  it('cannot use wildcards', () => {
+    for (const name of ['*', 'dbo.*', '[dbo].*']) {
+      expect(errorOf(() => requireProcedureName(name)).errorType).toBe(ErrorType.VALIDATION_ERROR);
+    }
   });
 });
 

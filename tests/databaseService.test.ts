@@ -667,6 +667,33 @@ describe('executeStoredProcedure', () => {
     expect(h.pools).toHaveLength(0);
   });
 
+  it('runs any procedure in a schema allowed by a schema.* entry, still rolled back', async () => {
+    h.scenario = { returnValue: 0 };
+    const { service, logger } = makeService({ allowedProcedures: ['dbo.*'] });
+
+    await service.executeStoredProcedure('dbo.GL_DistUpdate_UpdateDistributions_SP');
+
+    expect(h.requests.at(-1)?.command).toBe('dbo.GL_DistUpdate_UpdateDistributions_SP');
+    expect(h.events).toContain('rollback');
+    expect(h.events).not.toContain('commit');
+    expect(logger.warn).toHaveBeenCalledWith(
+      { entries: ['dbo.*'] },
+      expect.stringContaining('wildcard')
+    );
+    expect((await rejection(service.executeStoredProcedure('sales.GetOrders'))).errorType).toBe(ErrorType.PERMISSION_ERROR);
+  });
+
+  it('runs a procedure in any schema when the allow-list is *', async () => {
+    h.scenario = { returnValue: 0 };
+    const { service } = makeService({ allowedProcedures: ['*'] });
+    expect(service.allowedProcedureCount).toBe(1);
+
+    await service.executeStoredProcedure('sales.GetOrders');
+
+    expect(h.requests.at(-1)?.command).toBe('sales.GetOrders');
+    expect((await rejection(service.executeStoredProcedure('sys.sp_executesql'))).errorType).toBe(ErrorType.PERMISSION_ERROR);
+  });
+
   it('ignores unqualified allow-list entries with a warning', () => {
     const { service, logger } = makeService({ allowedProcedures: ['GetX', 'bad name', 'rpt.[Monthly]'] });
     expect(service.allowedProcedureCount).toBe(1);

@@ -44,7 +44,7 @@ The following table summarizes key environment variables. The defaults are those
 | **Security**         | `SQL_ENCRYPT`                    | Encrypt the connection; only `false` disables it                            | `true` (`docker-run.sh`: `false`) |
 |                      | `SQL_TRUST_SERVER_CERTIFICATE`   | Trust the server certificate; only `true` enables it (`SQL_TRUST_SERVER_CERT` also works, and is the name `docker-compose.yml` passes) | `false` (`docker-run.sh`: `true`) |
 |                      | `SQL_ALLOWED_DATABASES`          | Comma-separated list of DBs the server can access. Empty means no whitelist check (the login's permissions apply). | `""` (empty string)    |
-|                      | `SQL_ALLOWED_PROCEDURES`         | Comma-separated `schema.proc` names `execute_stored_procedure` may run. Empty means the tool is not registered. | `""` (empty string)    |
+|                      | `SQL_ALLOWED_PROCEDURES`         | Comma-separated `schema.proc` names, or `schema.*` / `*` wildcards, `execute_stored_procedure` may run (see `CONFIG.md`). Empty means the tool is not registered. | `""` (empty string)    |
 | **Results**          | `SQL_MAX_ROWS`                   | Maximum rows returned per result set. | `1000`                   |
 | **Timeouts & Retries** | `SQL_CONNECTION_TIMEOUT`         | Connection timeout (ms)                                                     | `15000`                  |
 |                      | `SQL_REQUEST_TIMEOUT`            | Request timeout for queries (ms)                                            | `15000`                  |

@@ -5,7 +5,7 @@ This is a Model Context Protocol (MCP) server for SQL Server interactions. It al
 ## Features
 
 - **Read-Only SQL Query Execution**: Run single-statement `SELECT` queries against SQL Server databases. Every query is validated and then run inside a transaction that is always rolled back. Results are streamed and paged, so only the requested page is held in memory.
-- **Allow-Listed Stored Procedures**: Execute stored procedures named in `SQL_ALLOWED_PROCEDURES`, with typed input and output parameters. Without an allow-list the tool is not offered at all.
+- **Allow-Listed Stored Procedures**: Execute stored procedures named in `SQL_ALLOWED_PROCEDURES` (exact `schema.proc` names, or `schema.*` / `*` wildcards), with typed input and output parameters. Without an allow-list the tool is not offered at all.
 - **Schema Exploration**: View tables and views with their columns, primary keys and foreign keys, with results cached for performance.
 - **Robust Connection Management**: One connection pool per database, created on first use and reused across calls, with configurable retry logic and timeouts. The server starts answering MCP requests without waiting for the database.
 - **Enhanced Security**:
@@ -56,7 +56,7 @@ For a detailed guide on all configuration options and how to set them up, please
 | **Security** | `SQL_ENCRYPT`               | Encrypt the connection; only the value `false` disables it                  | `true`                   |
 |          | `SQL_TRUST_SERVER_CERT` / `SQL_TRUST_SERVER_CERTIFICATE` | Trust the server certificate; only the value `true` enables it (either name works) | `false`                  |
 |          | `SQL_ALLOWED_DATABASES`     | Comma-separated list of databases the server is allowed to access. If empty, access is less restricted (relies on DB user permissions). | `[]` (empty list)        |
-|          | `SQL_ALLOWED_PROCEDURES`    | Comma-separated list of stored procedures `execute_stored_procedure` may run, as schema-qualified `schema.proc` or `[schema].[proc]` (case-insensitive). Entries without a schema are ignored with a warning. If no valid entry remains, the `execute_stored_procedure` tool is not registered. | `[]` (empty list)        |
+|          | `SQL_ALLOWED_PROCEDURES`    | Comma-separated list of stored procedures `execute_stored_procedure` may run, as schema-qualified `schema.proc` or `[schema].[proc]` (case-insensitive). `schema.*` allows every procedure in a schema and `*` allows every procedure outside `sys` and `INFORMATION_SCHEMA`; use wildcards only on local or non-production servers (see [`CONFIG.md`](docs/CONFIG.md)). Entries without a schema are ignored with a warning. If no valid entry remains, the `execute_stored_procedure` tool is not registered. | `[]` (empty list)        |
 | **Results** | `SQL_MAX_ROWS`              | Maximum rows returned per result set                                        | `1000`                   |
 | **Timeouts & Retries** | `SQL_CONNECTION_TIMEOUT`    | Connection timeout (ms)                                                     | `15000`                  |
 |          | `SQL_REQUEST_TIMEOUT`       | Request timeout for queries (ms)                                            | `15000`                  |
@@ -97,7 +97,7 @@ In the Claude conversation, you can:
     ```
     (The `database` attribute is optional if operating on the default `SQL_DATABASE` or if `SQL_ALLOWED_DATABASES` implies a single choice.)
 
-2.  Execute stored procedures (only available when `SQL_ALLOWED_PROCEDURES` is set, and only for the procedures it lists):
+2.  Execute stored procedures (only available when `SQL_ALLOWED_PROCEDURES` is set, and only for the procedures it lists or its wildcards match):
     ```xml
     <mcp:execute_stored_procedure database="YourDatabaseName">
     {
@@ -182,7 +182,7 @@ npm test            # vitest
 
 - **Single-statement `SELECT` validation**: `execute_query` accepts exactly one statement, and it must start with `SELECT` or `WITH`. The query is tokenised with T-SQL rules (`'...'` strings with `''` escapes, `N'...'`, `[...]` and `"..."` identifiers, `--` and nested `/* */` comments), so keywords inside strings, comments or bracketed names are ignored, and a second statement can't be hidden inside something that only looks like a string. Statement separators, `GO`, and keywords such as `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `EXEC`, `INTO`, `OPENQUERY`, `OPENROWSET`, `WAITFOR`, `DECLARE` or `SET` are rejected. The query must also parse as a single `SELECT`.
 - **Always rolled back**: every `execute_query` call, and every allowed stored procedure call, runs as `BEGIN TRANSACTION` → statement → `ROLLBACK`, whether the statement succeeds, fails, is cut off once the requested page is full, or is cancelled by the client. Any change a transaction can undo is discarded, and the connection goes back to the pool with no open transaction; if the rollback itself fails, that connection is closed and its pool replaced. Actions a transaction can't undo, such as some system procedures, linked-server calls or `BACKUP`, are not covered by this backstop.
-- **Procedures are allow-list only**: `execute_stored_procedure` runs only the procedures named in `SQL_ALLOWED_PROCEDURES`. Names must be schema-qualified (`schema.proc` or `[schema].[proc]`) and are compared case-insensitively; an unqualified name is rejected, because SQL Server would resolve it against the caller's default schema. Any other name is rejected with a permission error. When the list has no valid entries, the tool is not registered at all. The outer rollback does **not** undo changes a procedure commits itself (for example with its own `COMMIT`, or a `ROLLBACK` followed by further writes), so allow-list only procedures you trust to be read-only.
+- **Procedures are allow-list only**: `execute_stored_procedure` runs only the procedures named in `SQL_ALLOWED_PROCEDURES`, or matched by a `schema.*` or `*` entry there (a startup warning is logged when a wildcard is configured). Names must be schema-qualified (`schema.proc` or `[schema].[proc]`) and are compared case-insensitively; an unqualified name is rejected, because SQL Server would resolve it against the caller's default schema. Any other name is rejected with a permission error. When the list has no valid entries, the tool is not registered at all. The outer rollback does **not** undo changes a procedure commits itself (for example with its own `COMMIT`, or a `ROLLBACK` followed by further writes), so allow-list only procedures you trust to be read-only.
 - **Database Whitelisting**: Use the `SQL_ALLOWED_DATABASES` environment variable to restrict which databases the server can interact with. 3-part names in queries (`OtherDb.dbo.Table`) are checked against the same list, and 4-part (linked-server) names are rejected. For details, see [`DATABASE_WHITELISTING.md`](docs/DATABASE_WHITELISTING.md).
 - **Input Validation**: Database names and stored procedure names undergo format validation.
 - **Parameterized Inputs**: Stored procedure parameters are passed as typed parameters by the `mssql` library, not concatenated into SQL.
@@ -201,7 +201,7 @@ ALTER ROLE db_datareader ADD MEMBER mcp_reader;
 DENY EXECUTE TO mcp_reader;
 ```
 
-If you allow specific procedures through `SQL_ALLOWED_PROCEDURES`, grant `EXECUTE` on just those procedures instead of denying it database-wide (a database-level `DENY EXECUTE` overrides object-level grants).
+If you allow specific procedures through `SQL_ALLOWED_PROCEDURES`, grant `EXECUTE` on just those procedures (or `GRANT EXECUTE ON SCHEMA::<schema>` for a `schema.*` entry) instead of denying it database-wide (a database-level `DENY EXECUTE` overrides object-level grants).
 
 ## Troubleshooting
 
