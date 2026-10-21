@@ -107,14 +107,30 @@ export function extractDriverErrorInfo(error: unknown): DriverErrorInfo {
   const nested = (e.originalError ?? null) as { code?: unknown; number?: unknown; info?: { number?: unknown } } | null;
 
   const code = typeof e.code === 'string' ? e.code : typeof nested?.code === 'string' ? nested.code : undefined;
-  const numberCandidates = [e.number, e.info?.number, nested?.number, nested?.info?.number];
-  const sqlErrorNumber = numberCandidates.find((n): n is number => typeof n === 'number' && Number.isFinite(n));
+  // msnodesqlv8 reports the SQL Server error number of a failed login as a numeric `code`. ODBC
+  // errors raised outside SQL Server (driver not found, login timeout) carry 0, which is no error number.
+  const numberCandidates = [e.number, e.info?.number, nested?.number, nested?.info?.number, e.code, nested?.code];
+  const sqlErrorNumber = numberCandidates.find((n): n is number => typeof n === 'number' && Number.isInteger(n) && n > 0);
 
   return {
     ...(code !== undefined ? { code } : {}),
     ...(sqlErrorNumber !== undefined ? { sqlErrorNumber } : {}),
   };
 }
+
+/** The ODBC SQLSTATE of an msnodesqlv8 error (`state` once wrapped by mssql, `sqlstate` before), if present. */
+export function extractSqlState(error: unknown): string | undefined {
+  if (error === null || typeof error !== 'object') return undefined;
+  const e = error as { state?: unknown; sqlstate?: unknown; originalError?: { state?: unknown; sqlstate?: unknown } | null };
+  const candidates = [e.state, e.sqlstate, e.originalError?.state, e.originalError?.sqlstate];
+  return candidates.find((state): state is string => typeof state === 'string' && state.length === 5);
+}
+
+// ODBC SQLSTATE for a timeout, which msnodesqlv8 reports instead of ETIMEOUT
+const SQLSTATE_TIMEOUT = 'HYT00';
+
+/** Whether an ODBC SQLSTATE is in class 08, connection exceptions such as 08S01 (communication link failure). */
+const isConnectionExceptionState = (state: string | undefined) => state !== undefined && state.startsWith('08');
 
 /** Driver codes meaning the connection is unusable; the pool that produced them is rebuilt. */
 const CONNECTION_LOST_CODES: ReadonlySet<string> = new Set(['ESOCKET', 'ECONNCLOSED', 'ECONNRESET', 'ECLOSE', 'ENOTOPEN', 'ENOCONN']);
@@ -159,8 +175,13 @@ export function classifyError(error: unknown, defaultErrorType: ErrorType): Erro
 
   const info = extractDriverErrorInfo(error);
   const name = error !== null && typeof error === 'object' ? (error as { name?: unknown }).name : undefined;
-  const connectionLost = info.code !== undefined && CONNECTION_LOST_CODES.has(info.code);
+  const state = extractSqlState(error);
+  const connectionLost = (info.code !== undefined && CONNECTION_LOST_CODES.has(info.code)) || isConnectionExceptionState(state);
   const result = (errorType: ErrorType): ErrorClassification => ({ errorType, connectionLost, ...info });
+
+  if (state === SQLSTATE_TIMEOUT) {
+    return result(name === 'ConnectionError' ? ErrorType.CONNECTION_TIMEOUT : ErrorType.QUERY_TIMEOUT);
+  }
 
   switch (info.code) {
     case 'ETIMEOUT':
@@ -174,14 +195,15 @@ export function classifyError(error: unknown, defaultErrorType: ErrorType): Erro
       return result(ErrorType.VALIDATION_ERROR);
   }
 
-  if (info.code !== undefined && CONNECTION_FAILURE_CODES.has(info.code)) {
+  if (connectionLost || (info.code !== undefined && CONNECTION_FAILURE_CODES.has(info.code))) {
     return result(ErrorType.CONNECTION_ERROR);
   }
+  // Any other failure to connect, including a login msnodesqlv8 reports by its SQL Server error number
+  if (name === 'ConnectionError') return result(ErrorType.CONNECTION_ERROR);
   if (info.sqlErrorNumber !== undefined) {
     if (PERMISSION_ERROR_NUMBERS.has(info.sqlErrorNumber)) return result(ErrorType.PERMISSION_ERROR);
     if (CONSTRAINT_ERROR_NUMBERS.has(info.sqlErrorNumber)) return result(ErrorType.VALIDATION_ERROR);
   }
-  if (name === 'ConnectionError') return result(ErrorType.CONNECTION_ERROR);
   return result(defaultErrorType);
 }
 

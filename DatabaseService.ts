@@ -1,6 +1,6 @@
 import sql from 'mssql';
 import { Logger } from 'pino';
-import { MssqlMcpError, ErrorType, classifyError, extractDriverErrorInfo, toMssqlMcpError } from './errors.js';
+import { MssqlMcpError, ErrorType, classifyError, extractDriverErrorInfo, extractSqlState, toMssqlMcpError } from './errors.js';
 import { validateReadOnlyQuery } from './queryValidator.js';
 import {
   RecordsetPager,
@@ -19,6 +19,8 @@ import { SCHEMA_QUERY, buildTableSchemas, type ForeignKeyRow, type SchemaColumnR
 import { formatOutputParameters } from './temporalFormat.js';
 import { installDateTimeOffsetPatch, type DateTimeOffsetMode } from './datetimeoffsetPatch.js';
 import { databaseNameKey, normalizeDatabaseName } from './databaseName.js';
+import { buildTrustedConnectionString, type SqlDriver } from './sqlDriver.js';
+import { DEFAULT_ODBC_DRIVER, type AuthenticationMode } from './config.js';
 
 export type { QueryResult, Recordset, TableSchema, ProcedureParameterInput };
 
@@ -31,12 +33,23 @@ const SQL_ERROR_NO_CORRESPONDING_BEGIN_TRAN = 3903;
 // SQL Server error number for "Cannot open database requested by the login."
 const SQL_ERROR_CANNOT_OPEN_DATABASE = 4060;
 
+// SQL Server error numbers for logins the server refused; retrying does not help. tedious reports
+// these as ELOGIN, msnodesqlv8 as the error's numeric code.
+const LOGIN_REFUSED_ERROR_NUMBERS: ReadonlySet<number> = new Set([SQL_ERROR_CANNOT_OPEN_DATABASE, 18452, 18456, 18470]);
+
+// ODBC SQLSTATE msnodesqlv8 reports for a cancelled request ("Operation canceled")
+const ODBC_SQLSTATE_OPERATION_CANCELED = 'HY008';
+
 // Pools for databases other than the default one are closed after this long without use
 const POOL_IDLE_TTL_MS = 10 * 60 * 1000;
 const POOL_SWEEP_INTERVAL_MS = 60 * 1000;
 
 // Define SqlConfig interface
 export interface SqlConfig {
+  /** `sql` (default) logs in with user and password; `windows` as the Windows account running the server. */
+  authenticationMode?: AuthenticationMode;
+  /** ODBC driver for Windows authentication; defaults to ODBC Driver 18 for SQL Server. */
+  odbcDriver?: string;
   server: string;
   port: number;
   user: string;
@@ -98,9 +111,12 @@ interface StreamOutcome {
   rowsAffected: number[];
 }
 
-/** The tedious connection a transaction holds; read only to close it after a failed rollback. */
+/** The driver connection a transaction holds; used only to discard it after a failed rollback. */
 interface HeldConnection {
+  /** tedious: closes the connection. */
   close?: () => void;
+  /** msnodesqlv8: a connection marked with it fails pool validation and is closed by the pool. */
+  hasError?: boolean;
 }
 
 function cancelledError(): MssqlMcpError {
@@ -114,6 +130,18 @@ function throwIfAborted(signal?: AbortSignal): void {
 function errorCode(error: unknown): string | undefined {
   const code = error !== null && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
   return typeof code === 'string' ? code : undefined;
+}
+
+/** Whether the error is a login the server refused, which a retry would not change. */
+function isLoginRefused(error: unknown): boolean {
+  if (errorCode(error) === 'ELOGIN') return true;
+  const { sqlErrorNumber } = extractDriverErrorInfo(error);
+  return sqlErrorNumber !== undefined && LOGIN_REFUSED_ERROR_NUMBERS.has(sqlErrorNumber);
+}
+
+/** Whether the error reports a cancelled request: ECANCEL from tedious, SQLSTATE HY008 from msnodesqlv8. */
+function isCancellation(error: unknown): boolean {
+  return errorCode(error) === 'ECANCEL' || extractSqlState(error) === ODBC_SQLSTATE_OPERATION_CANCELED;
 }
 
 function querySnippet(query: string): string {
@@ -130,6 +158,8 @@ export class DatabaseService {
 
   private readonly sqlConfig: SqlConfig;
   private readonly logger: Logger;
+  private readonly driver: SqlDriver;
+  private readonly windowsAuthentication: boolean;
   // Allowed databases: comparison key -> the name as spelled in the allow-list, without delimiters
   private readonly allowedDatabaseNames: ReadonlyMap<string, string>;
   // Allowed databases as spelled in the allow-list, without delimiters, for the query validator
@@ -142,9 +172,15 @@ export class DatabaseService {
   /** Whether datetimeoffset values keep their original offset or are rendered in UTC. */
   public readonly dateTimeOffsetMode: DateTimeOffsetMode;
 
-  constructor(sqlConfig: SqlConfig, logger: Logger) {
+  /**
+   * `driver` must match the authentication mode: the default tedious module for SQL logins,
+   * the msnodesqlv8 module from `loadSqlDriver` for Windows authentication.
+   */
+  constructor(sqlConfig: SqlConfig, logger: Logger, driver: SqlDriver = sql) {
     this.sqlConfig = sqlConfig;
     this.logger = logger;
+    this.driver = driver;
+    this.windowsAuthentication = sqlConfig.authenticationMode === 'windows';
     const allowedDatabaseNames = new Map<string, string>();
     for (const entry of sqlConfig.allowedDatabases || []) {
       const name = normalizeDatabaseName(entry);
@@ -167,15 +203,20 @@ export class DatabaseService {
     this.maxRows = configuredMaxRows !== undefined && Number.isFinite(configuredMaxRows) && configuredMaxRows >= 1
       ? Math.floor(configuredMaxRows)
       : DEFAULT_MAX_ROWS;
-    const datetimeoffset = installDateTimeOffsetPatch();
-    this.dateTimeOffsetMode = datetimeoffset.mode;
-    if (datetimeoffset.firstAttempt && datetimeoffset.reason !== undefined) {
-      this.logger.warn(
-        { reason: datetimeoffset.reason },
-        'DatabaseService: Could not patch the driver to keep datetimeoffset offsets; datetimeoffset values are returned in UTC (+00:00).'
-      );
+    if (this.windowsAuthentication) {
+      // The offset patch works on tedious only; msnodesqlv8 delivers datetimeoffset values as UTC instants
+      this.dateTimeOffsetMode = 'utc-fallback';
+    } else {
+      const datetimeoffset = installDateTimeOffsetPatch();
+      this.dateTimeOffsetMode = datetimeoffset.mode;
+      if (datetimeoffset.firstAttempt && datetimeoffset.reason !== undefined) {
+        this.logger.warn(
+          { reason: datetimeoffset.reason },
+          'DatabaseService: Could not patch the driver to keep datetimeoffset offsets; datetimeoffset values are returned in UTC (+00:00).'
+        );
+      }
     }
-    this.logger.debug({ datetimeoffsetMode: datetimeoffset.mode }, 'DatabaseService: datetimeoffset rendering mode.');
+    this.logger.debug({ datetimeoffsetMode: this.dateTimeOffsetMode }, 'DatabaseService: datetimeoffset rendering mode.');
     this.logger.info('DatabaseService instantiated.');
   }
 
@@ -281,7 +322,7 @@ export class DatabaseService {
    * share one attempt through `entry.connecting`, so only one retry chain runs per database.
    */
   private async connectWithRetry(entry: PoolEntry): Promise<sql.ConnectionPool> {
-    if (!this.sqlConfig.password) {
+    if (!this.windowsAuthentication && !this.sqlConfig.password) {
       this.logger.error('DatabaseService: SQL Server password not provided. Set SQL_PASSWORD environment variable.');
       throw new MssqlMcpError('SQL Server password not provided.', ErrorType.VALIDATION_ERROR, undefined, { missingVariable: 'SQL_PASSWORD' });
     }
@@ -294,21 +335,7 @@ export class DatabaseService {
 
     for (let attempt = 0; attempt < attempts && !entry.retired; attempt++) {
       const attemptLoginErrors: number[] = [];
-      const pool = new sql.ConnectionPool({
-        ...this.sqlConfig,
-        database: entry.database,
-        requestTimeout: this.sqlConfig.requestTimeout || 30000,
-        connectionTimeout: this.sqlConfig.connectionTimeout || 30000,
-        // Date/time values are built from UTC fields so they render without the process time zone
-        options: { ...this.sqlConfig.options, useUTC: true },
-        beforeConnect: (connection) => {
-          const onErrorMessage = (token: { number?: unknown }) => {
-            if (typeof token.number === 'number') attemptLoginErrors.push(token.number);
-          };
-          connection.on('errorMessage', onErrorMessage);
-          connection.once('connect', () => connection.removeListener('errorMessage', onErrorMessage));
-        },
-      });
+      const pool = new this.driver.ConnectionPool(this.poolConfig(entry.database, attemptLoginErrors));
       pool.on('error', (err: Error) => {
         this.logger.error({ err, database: entry.database }, 'DatabaseService: SQL pool reported an error.');
       });
@@ -325,7 +352,7 @@ export class DatabaseService {
         await this.closePoolQuietly(pool, entry.database);
         this.logger.warn({ err: error, database: entry.database, attempt: attempt + 1, attempts }, 'DatabaseService: Connection attempt failed.');
         // A rejected login does not succeed on retry
-        if (errorCode(error) === 'ELOGIN' || attempt + 1 >= attempts) break;
+        if (isLoginRefused(error) || attempt + 1 >= attempts) break;
         const delay = Math.min(
           this.sqlConfig.initialRetryDelay * Math.pow(2, attempt) + Math.random() * 1000,
           this.sqlConfig.maxRetryDelay
@@ -366,6 +393,52 @@ export class DatabaseService {
       { database: entry.database, attempts },
       { code: wrapped.code, sqlErrorNumber: wrapped.sqlErrorNumber }
     );
+  }
+
+  /**
+   * The pool configuration for `database`. SQL logins connect through tedious, collecting the
+   * SQL Server error numbers sent during login into `loginErrors`. Windows authentication
+   * connects through msnodesqlv8 with a trusted ODBC connection string and sends no credentials.
+   */
+  private poolConfig(database: string, loginErrors: number[]): sql.config & { connectionString?: string } {
+    const common = {
+      requestTimeout: this.sqlConfig.requestTimeout || 30000,
+      connectionTimeout: this.sqlConfig.connectionTimeout || 30000,
+      // Date/time values are built from UTC fields so they render without the process time zone
+      options: { ...this.sqlConfig.options, useUTC: true },
+    };
+
+    if (this.windowsAuthentication) {
+      const { server, port, pool, options } = this.sqlConfig;
+      return {
+        ...common,
+        server,
+        port,
+        database,
+        pool,
+        connectionString: buildTrustedConnectionString({
+          driver: this.sqlConfig.odbcDriver || DEFAULT_ODBC_DRIVER,
+          server,
+          port,
+          database,
+          encrypt: options?.encrypt ?? true,
+          trustServerCertificate: options?.trustServerCertificate ?? false,
+        }),
+      };
+    }
+
+    return {
+      ...this.sqlConfig,
+      ...common,
+      database,
+      beforeConnect: (connection) => {
+        const onErrorMessage = (token: { number?: unknown }) => {
+          if (typeof token.number === 'number') loginErrors.push(token.number);
+        };
+        connection.on('errorMessage', onErrorMessage);
+        connection.once('connect', () => connection.removeListener('errorMessage', onErrorMessage));
+      },
+    };
   }
 
   /**
@@ -479,11 +552,11 @@ export class DatabaseService {
     signal: AbortSignal | undefined,
     work: (request: sql.Request) => Promise<T>
   ): Promise<T> {
-    const transaction = new sql.Transaction(pool);
+    const transaction = new this.driver.Transaction(pool);
     try {
       await transaction.begin();
       throwIfAborted(signal);
-      return await work(new sql.Request(transaction));
+      return await work(new this.driver.Request(transaction));
     } finally {
       const outcome = await this.rollbackQuietly(transaction, operation);
       if (outcome === 'unsafe') this.retireEntry(entry, 'rollback failed');
@@ -519,7 +592,11 @@ export class DatabaseService {
       }
 
       this.logger.error({ err: rollbackError, operation }, 'DatabaseService: Rollback of read-only transaction failed; closing its connection.');
-      if (held && typeof held.close === 'function') {
+      if (held && this.windowsAuthentication) {
+        // mssql has already returned it to the pool, and msnodesqlv8 never calls back from closing a
+        // closed connection, which would stall the pool's destroy; the pool closes it instead
+        held.hasError = true;
+      } else if (held && typeof held.close === 'function') {
         try {
           held.close();
         } catch (closeError: unknown) {
@@ -578,7 +655,7 @@ export class DatabaseService {
     }
 
     if (abortedByClient) throw cancelledError();
-    const failure = errors.find((err) => !(pageFull && errorCode(err) === 'ECANCEL'));
+    const failure = errors.find((err) => !(pageFull && isCancellation(err)));
     if (failure !== undefined) throw failure;
 
     return {

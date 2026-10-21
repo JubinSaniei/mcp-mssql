@@ -1,4 +1,4 @@
-import { formatTemporalValue, formatUntypedDate, temporalColumnFromType, type TemporalColumn } from './temporalFormat.js';
+import { formatTemporalValue, formatUntypedDate, temporalColumnFromMetadata, type TemporalColumn } from './temporalFormat.js';
 
 /** A result set as returned to MCP clients: column names plus positional rows. */
 export interface Recordset {
@@ -44,7 +44,7 @@ function columnsFromMetadata(columns: unknown): ColumnInfo[] {
     .map((column, position) => ({
       name: typeof column?.name === 'string' ? column.name : '',
       index: typeof column?.index === 'number' ? column.index : position,
-      temporal: temporalColumnFromType(column?.type, column?.scale),
+      temporal: temporalColumnFromMetadata(column?.type, column?.scale),
     }))
     .sort((a, b) => a.index - b.index)
     .map(({ name, temporal }) => ({ name, temporal }));

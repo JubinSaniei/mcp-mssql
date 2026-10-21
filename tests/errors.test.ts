@@ -11,6 +11,38 @@ function driverError(name: string, code: string, number?: number): Error {
 }
 
 describe('classifyError', () => {
+  it('reads the error number of an msnodesqlv8 login failure from its numeric code', () => {
+    const odbc = Object.assign(new Error("[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Login failed for user 'u'."), { code: 18456, sqlstate: '28000' });
+    const wrapped = new sql.ConnectionError(odbc);
+    expect(extractDriverErrorInfo(wrapped)).toEqual({ sqlErrorNumber: 18456 });
+    expect(classifyError(wrapped, ErrorType.QUERY_ERROR).errorType).toBe(ErrorType.CONNECTION_ERROR);
+  });
+
+  it('ignores the native error 0 of ODBC errors raised outside SQL Server', () => {
+    const wrapped = new sql.ConnectionError('[Microsoft][ODBC Driver Manager] Data source name not found', 0 as unknown as sql.MSSQL_ERROR_CODE);
+    expect(extractDriverErrorInfo(wrapped)).toEqual({});
+    expect(classifyError(wrapped, ErrorType.QUERY_ERROR).errorType).toBe(ErrorType.CONNECTION_ERROR);
+  });
+
+  it('classifies msnodesqlv8 timeouts and lost connections by SQLSTATE', () => {
+    const odbc = (sqlstate: string) => Object.assign(new Error(`state ${sqlstate}`), { code: 0, sqlstate });
+    const requestError = (sqlstate: string) => Object.assign(new sql.RequestError(odbc(sqlstate), 'EREQUEST'), { code: 'EREQUEST' });
+
+    expect(classifyError(requestError('HYT00'), ErrorType.QUERY_ERROR)).toMatchObject({ errorType: ErrorType.QUERY_TIMEOUT, connectionLost: false });
+    expect(classifyError(requestError('08S01'), ErrorType.QUERY_ERROR)).toMatchObject({ errorType: ErrorType.CONNECTION_ERROR, connectionLost: true });
+    expect(classifyError(requestError('42S02'), ErrorType.QUERY_ERROR)).toMatchObject({ errorType: ErrorType.QUERY_ERROR, connectionLost: false });
+    expect(classifyError(Object.assign(new sql.ConnectionError('Login timeout expired'), { sqlstate: 'HYT00' }), ErrorType.QUERY_ERROR).errorType)
+      .toBe(ErrorType.CONNECTION_TIMEOUT);
+  });
+
+  it('reads the error number of an msnodesqlv8 request error', () => {
+    const odbc = Object.assign(new Error('The SELECT permission was denied.'), { code: 229, sqlstate: '42000' });
+    // As in mssql's msnodesqlv8 driver, which sets the code after wrapping
+    const wrapped = Object.assign(new sql.RequestError(odbc, 'EREQUEST'), { code: 'EREQUEST' });
+    const result = classifyError(wrapped, ErrorType.QUERY_ERROR);
+    expect(result).toMatchObject({ code: 'EREQUEST', sqlErrorNumber: 229, errorType: ErrorType.PERMISSION_ERROR });
+  });
+
   it('reports request timeouts as query timeouts and connect timeouts as connection timeouts', () => {
     expect(classifyError(driverError('RequestError', 'ETIMEOUT'), ErrorType.QUERY_ERROR).errorType).toBe(ErrorType.QUERY_TIMEOUT);
     expect(classifyError(driverError('ConnectionError', 'ETIMEOUT'), ErrorType.QUERY_ERROR).errorType).toBe(ErrorType.CONNECTION_TIMEOUT);

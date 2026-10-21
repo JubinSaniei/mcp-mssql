@@ -6,6 +6,7 @@ import {
   formatTemporal,
   formatTemporalValue,
   formatUntypedDate,
+  temporalColumnFromMetadata,
   temporalColumnFromSqlType,
   temporalColumnFromType,
   type TemporalColumn,
@@ -27,12 +28,12 @@ import {
 } from './tdsTemporal.js';
 import { toCompactJson } from '../resultFormat.js';
 
-const col = (kind: TemporalColumn['kind'], scale = 7): TemporalColumn => ({ kind, scale });
+const col = (kind: TemporalColumn['kind'], scale = 7): TemporalColumn & { scale: number } => ({ kind, scale });
 
 /** Decodes with the driver and renders the value as the server does. */
 function render(buf: Buffer, typeName: string, column: TemporalColumn, patched = true): unknown {
   const readValue = patched ? wrapReadValue(originalReadValue()) : originalReadValue();
-  return formatTemporalValue(decode(buf, typeName, column.scale, readValue), column);
+  return formatTemporalValue(decode(buf, typeName, column.scale ?? undefined, readValue), column);
 }
 
 const OCT_1 = { year: 2026, month: 10, day: 1 };
@@ -250,6 +251,15 @@ describe('temporalColumnFromType / temporalColumnFromSqlType', () => {
     expect(temporalColumnFromType(sql.DateTimeOffset, 7)).toEqual({ kind: 'datetimeoffset', scale: 7 });
     expect(temporalColumnFromType(sql.DateTime)).toEqual({ kind: 'datetime', scale: 7 });
     expect(temporalColumnFromType(sql.SmallDateTime)).toEqual({ kind: 'smalldatetime', scale: 7 });
+  });
+
+  it('gives result-set columns without a reported scale a null scale', () => {
+    expect(temporalColumnFromMetadata(sql.DateTime2, undefined)).toEqual({ kind: 'datetime2', scale: null });
+    expect(temporalColumnFromMetadata(sql.Time, undefined)).toEqual({ kind: 'time', scale: null });
+    expect(temporalColumnFromMetadata(sql.DateTimeOffset, undefined)).toEqual({ kind: 'datetimeoffset', scale: null });
+    expect(temporalColumnFromMetadata(sql.DateTime2, 3)).toEqual({ kind: 'datetime2', scale: 3 });
+    expect(temporalColumnFromMetadata(sql.DateTime, undefined)).toEqual({ kind: 'datetime', scale: 7 });
+    expect(temporalColumnFromMetadata(sql.Int, undefined)).toBeNull();
   });
 
   it('treats a missing or invalid scale as 7', () => {

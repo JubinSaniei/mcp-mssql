@@ -10,10 +10,11 @@ import {
   type QueryResult,
   type StoredProcedureResult,
 } from './DatabaseService.js';
-import { ErrorType, toClientError, toMssqlMcpError } from './errors.js';
+import { ErrorType, MssqlMcpError, toClientError, toMssqlMcpError } from './errors.js';
 import { SQL_PARAMETER_TYPES } from './procedures.js';
 import { toCompactJson } from './resultFormat.js';
 import { ConfigError, loadConfig, type AppConfig } from "./config.js";
+import { loadSqlDriver, type SqlDriver } from './sqlDriver.js';
 import { pino } from "pino";
 
 /**
@@ -40,6 +41,19 @@ function readConfig(): AppConfig {
     return loadConfig();
   } catch (error: unknown) {
     if (error instanceof ConfigError) {
+      process.stderr.write(`${error.message}\n`);
+      process.exit(1);
+    }
+    throw error;
+  }
+}
+
+/** Loads the driver for the configured authentication mode, or reports why it cannot and exits. */
+async function readSqlDriver(config: AppConfig): Promise<SqlDriver> {
+  try {
+    return await loadSqlDriver(config.authenticationMode);
+  } catch (error: unknown) {
+    if (error instanceof MssqlMcpError) {
       process.stderr.write(`${error.message}\n`);
       process.exit(1);
     }
@@ -75,7 +89,7 @@ const server = new McpServer({
 });
 
 // Creating the service does not connect; pools connect on first use
-const databaseService = new DatabaseService(appConfig, logger);
+const databaseService = new DatabaseService(appConfig, logger, await readSqlDriver(appConfig));
 const maxRows = databaseService.maxRowsPerRecordset;
 
 function rowCountOf(recordsets: Array<{ recordCount: number }>): number {
@@ -107,7 +121,12 @@ const spParamSchema = z.object({
   scale: z.number().int().min(0).max(38).optional().describe("Scale for decimal and numeric (default 0), or fractional-second scale 0-7 for time, datetime2 and datetimeoffset (default 7)")
 });
 
-const DATE_TIME_OUTPUT_DESCRIPTION = "Date and time values are returned as their SQL text, with as many fractional-second digits as the column's scale: date '2026-10-01', time '13:45:00.1234567', datetime2 '2026-10-01T12:34:56.1234567' and datetime '2026-10-01T12:34:56.123' (wall-clock values with no time zone), smalldatetime '2026-10-01T12:34:00', and datetimeoffset " +
+const DATE_TIME_OUTPUT_DESCRIPTION = "Date and time values are returned as their SQL text, " +
+  // The Windows-authentication driver does not report column scales
+  (appConfig.authenticationMode === 'windows'
+    ? "with trailing zeros removed from the fractional seconds of time, datetime2 and datetimeoffset values"
+    : "with as many fractional-second digits as the column's scale") +
+  ": date '2026-10-01', time '13:45:00.1234567', datetime2 '2026-10-01T12:34:56.1234567' and datetime '2026-10-01T12:34:56.123' (wall-clock values with no time zone), smalldatetime '2026-10-01T12:34:00', and datetimeoffset " +
   (databaseService.dateTimeOffsetMode === 'offset-preserved'
     ? "'2026-10-01T12:34:56.1234567+05:30', which keeps its original offset."
     : "converted to UTC, e.g. '2026-10-01T07:04:56.1234567+00:00' (the original offset is not available).") +
@@ -283,6 +302,7 @@ process.on('unhandledRejection', (reason: unknown) => {
 async function main() {
   logger.info('Starting MSSQL MCP server...');
   logger.info({
+    authenticationMode: appConfig.authenticationMode,
     server: appConfig.server,
     port: appConfig.port,
     database: appConfig.database,

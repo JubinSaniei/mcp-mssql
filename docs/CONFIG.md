@@ -29,9 +29,26 @@ All options are set as environment variables in the `.env` file.
 ### Database Connection Settings
 -   `SQL_SERVER`: SQL Server hostname or IP address (Default: `localhost`)
 -   `SQL_PORT`: SQL Server port (Default: `1433`)
--   `SQL_USER`: SQL Server username (Default: `sa`)
--   `SQL_PASSWORD`: SQL Server password (Default: `yourStrong(!)Password`)
+-   `SQL_AUTH`: How the server logs in, `sql` or `windows`, case-insensitive (Default: `sql`). See [Windows Authentication](#windows-authentication).
+-   `SQL_USER`: SQL Server username (Default: `sa`). Not used with `SQL_AUTH=windows`.
+-   `SQL_PASSWORD`: SQL Server password (Default: `yourStrong(!)Password`). Not used with `SQL_AUTH=windows`.
 -   `SQL_DATABASE`: Default database name (Default: `master`)
+-   `SQL_ODBC_DRIVER`: ODBC driver used with `SQL_AUTH=windows` (Default: `ODBC Driver 18 for SQL Server`)
+
+### Windows Authentication
+With `SQL_AUTH=windows` the server logs in as the Windows account that runs it (a trusted connection, as in SSMS), so no user name or password is configured or sent. It requires:
+
+-   The server running on Windows (not in the Docker image); it refuses to start otherwise.
+-   The `msnodesqlv8` package, an optional dependency that `npm install` adds on Windows (prebuilt binaries, no compiler needed).
+-   The ODBC driver named by `SQL_ODBC_DRIVER` installed on the machine.
+-   A SQL Server login for that Windows account (or one of its groups) with access to the databases you use.
+
+`SQL_ENCRYPT` and `SQL_TRUST_SERVER_CERTIFICATE` apply as with SQL logins. A named instance (`SQL_SERVER=host\INSTANCE`) is found through SQL Server Browser, and `SQL_PORT` is then not used.
+
+Windows authentication uses the `msnodesqlv8` driver instead of `tedious`, which changes two things in query results:
+
+-   `datetimeoffset` values are returned converted to UTC with `+00:00`; the original offset is not available (the `utc-fallback` mode below).
+-   The driver does not report column scales, so `time`, `datetime2` and `datetimeoffset` values are returned with trailing fractional-second zeros removed (`datetime2(0)` as `2026-10-01T12:34:56`, `datetime2(7)` holding `.1200000` as `2026-10-01T12:34:56.12`).
 
 ### Security Settings
 -   `SQL_ENCRYPT`: Whether to encrypt the connection. Any value other than `false` encrypts (Default: `true`)

@@ -48,9 +48,11 @@ For a detailed guide on all configuration options and how to set them up, please
 |----------|-----------------------------|-----------------------------------------------------------------------------|--------------------------|
 | **Connection** | `SQL_SERVER`                | SQL Server hostname or IP                                                   | `localhost`              |
 |          | `SQL_PORT`                  | SQL Server port                                                             | `1433`                   |
-|          | `SQL_USER`                  | SQL Server username                                                         | `sa`                     |
-|          | `SQL_PASSWORD`              | SQL Server password                                                         | `yourStrong(!)Password`  |
+|          | `SQL_AUTH`                  | `sql` to log in with `SQL_USER`/`SQL_PASSWORD`, `windows` to log in as the Windows account running the server (Windows only; see [`CONFIG`](docs/CONFIG.md#windows-authentication)) | `sql` |
+|          | `SQL_USER`                  | SQL Server username (not used with `SQL_AUTH=windows`)                      | `sa`                     |
+|          | `SQL_PASSWORD`              | SQL Server password (not used with `SQL_AUTH=windows`)                      | `yourStrong(!)Password`  |
 |          | `SQL_DATABASE`              | Default database name to connect to                                         | `master`                 |
+|          | `SQL_ODBC_DRIVER`           | ODBC driver used with `SQL_AUTH=windows`                                    | `ODBC Driver 18 for SQL Server` |
 | **Security** | `SQL_ENCRYPT`               | Encrypt the connection; only the value `false` disables it                  | `true`                   |
 |          | `SQL_TRUST_SERVER_CERT` / `SQL_TRUST_SERVER_CERTIFICATE` | Trust the server certificate; only the value `true` enables it (either name works) | `false`                  |
 |          | `SQL_ALLOWED_DATABASES`     | Comma-separated list of databases the server is allowed to access. If empty, access is less restricted (relies on DB user permissions). | `[]` (empty list)        |
@@ -150,6 +152,8 @@ The `DatabaseService` keeps one `mssql` connection pool per database, keyed case
 ## Development
 
 ### Local Development Setup
+
+Requires Node.js 22 or later.
 
 ```bash
 # Install dependencies

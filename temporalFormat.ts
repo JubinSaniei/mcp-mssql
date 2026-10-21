@@ -17,14 +17,20 @@ export type TemporalKind = 'date' | 'time' | 'datetime2' | 'datetimeoffset' | 'd
 
 export interface TemporalColumn {
   kind: TemporalKind;
-  /** Fractional-second digits, 0-7. Used by time, datetime2 and datetimeoffset. */
-  scale: number;
+  /**
+   * Fractional-second digits, 0-7. Used by time, datetime2 and datetimeoffset. null when the
+   * driver does not report the column's scale; the fraction is then shown with trailing
+   * zeros removed.
+   */
+  scale: number | null;
 }
 
 /** Non-enumerable property holding a datetimeoffset value's UTC offset in minutes. */
 export const DATETIMEOFFSET_MINUTES = Symbol.for('mcp-mssql.datetimeoffsetMinutes');
 
 const TEMPORAL_KINDS: ReadonlySet<string> = new Set<TemporalKind>(['date', 'time', 'datetime2', 'datetimeoffset', 'datetime', 'smalldatetime']);
+/** Kinds whose fractional-second digits follow the column's scale. */
+const SCALED_KINDS: ReadonlySet<TemporalKind> = new Set<TemporalKind>(['time', 'datetime2', 'datetimeoffset']);
 const MAX_SCALE = 7;
 const TICKS_PER_MILLISECOND = 10_000;
 
@@ -42,6 +48,16 @@ export function temporalColumnFromType(type: unknown, scale?: unknown): Temporal
   const declaration = (type as { declaration?: unknown }).declaration;
   if (typeof declaration !== 'string' || !TEMPORAL_KINDS.has(declaration)) return null;
   return { kind: declaration as TemporalKind, scale: normaliseScale(scale) };
+}
+
+/**
+ * Identifies a date/time result-set column from driver column metadata. msnodesqlv8 does not
+ * report column scales, so a time, datetime2 or datetimeoffset column without one gets a null
+ * scale rather than 7.
+ */
+export function temporalColumnFromMetadata(type: unknown, scale: unknown): TemporalColumn | null {
+  const column = temporalColumnFromType(type, scale);
+  return column !== null && scale === undefined && SCALED_KINDS.has(column.kind) ? { ...column, scale: null } : column;
 }
 
 /**
@@ -67,8 +83,9 @@ function subSecondTicks(value: Date): number {
   return value.getUTCMilliseconds() * TICKS_PER_MILLISECOND + clamped;
 }
 
-/** ".fffffff" cut to `digits` digits, or "" for 0 digits. */
-function fraction(value: Date, digits: number): string {
+/** ".fffffff" cut to `digits` digits, or "" for 0 digits; with trailing zeros removed when `digits` is null. */
+function fraction(value: Date, digits: number | null): string {
+  if (digits === null) return trimmedFraction(value);
   if (digits <= 0) return '';
   return `.${pad(subSecondTicks(value), MAX_SCALE).slice(0, digits)}`;
 }

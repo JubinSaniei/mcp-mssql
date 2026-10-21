@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Logger } from 'pino';
 import { ErrorType, MssqlMcpError } from '../errors.js';
 
-interface FakeError { code?: string; number?: number; message: string; name?: string; originalError?: { number?: number } }
+interface FakeError { code?: string | number; number?: number; state?: string; message: string; name?: string; originalError?: { number?: number } }
 
 interface Scenario {
   recordsets?: Array<{ columns: string[]; rows: unknown[][] }>;
@@ -14,10 +14,15 @@ interface Scenario {
   /** Makes pool.connect() fail with this error, after sending these login error numbers. */
   connectError?: FakeError;
   loginErrorNumbers?: number[];
+  /** Error a cancelled request reports instead of tedious's ECANCEL, as msnodesqlv8 does. */
+  cancelError?: FakeError;
 }
 
 interface FakePoolConfig {
   database: string;
+  connectionString?: string;
+  user?: string;
+  password?: string;
   beforeConnect?: (connection: import('node:events').EventEmitter) => void;
 }
 
@@ -143,7 +148,7 @@ vi.mock('mssql', async (importOriginal) => {
         }
       }
       await tick();
-      if (this.canceled) this.emit('error', toError({ name: 'RequestError', code: 'ECANCEL', message: 'Canceled.' }));
+      if (this.canceled) this.emit('error', toError(scenario.cancelError ?? { name: 'RequestError', code: 'ECANCEL', message: 'Canceled.' }));
       else if (scenario.error) this.emit('error', toError(scenario.error));
       if (this.parent) this.parent.activeRequest = null;
       h.events.push('request-done');
@@ -666,5 +671,100 @@ describe('executeStoredProcedure', () => {
     const { service, logger } = makeService({ allowedProcedures: ['GetX', 'bad name', 'rpt.[Monthly]'] });
     expect(service.allowedProcedureCount).toBe(1);
     expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Windows authentication', () => {
+  const windows = { authenticationMode: 'windows' as const, odbcDriver: 'ODBC Driver 18 for SQL Server', user: '', password: undefined };
+
+  it('connects as the Windows account through a trusted ODBC connection string', async () => {
+    h.scenario = { recordsets: [{ columns: ['n'], rows: [[1]] }] };
+    const { service } = makeService({ ...windows, options: { encrypt: false, trustServerCertificate: true } });
+
+    await service.executeQuery('SELECT 1', 'Other');
+
+    const config = h.pools[0].config;
+    expect(config.connectionString).toBe(
+      'Driver={ODBC Driver 18 for SQL Server};Trusted_Connection=yes;Encrypt=no;TrustServerCertificate=yes;Server=localhost,1433;Database=Other'
+    );
+    expect(config.database).toBe('Other');
+    expect(config.user).toBeUndefined();
+    expect(config.password).toBeUndefined();
+    expect(config.beforeConnect).toBeUndefined();
+    expect((config as unknown as { options: { useUTC?: boolean } }).options.useUTC).toBe(true);
+  });
+
+  it('still requires a password for SQL logins', async () => {
+    const { service } = makeService({ password: undefined });
+    const error = await rejection(service.executeQuery('SELECT 1'));
+    expect(error.errorType).toBe(ErrorType.VALIDATION_ERROR);
+    expect(h.pools).toHaveLength(0);
+  });
+
+  it('reports datetimeoffset values in UTC, as the offset patch only applies to tedious', () => {
+    const { service } = makeService(windows);
+    expect(service.dateTimeOffsetMode).toBe('utc-fallback');
+  });
+
+  it('does not retry a login the server refused (numeric msnodesqlv8 code)', async () => {
+    h.scenario = { connectError: { name: 'ConnectionError', code: 18456, message: "Login failed for user 'u'." } };
+    const { service } = makeService({ ...windows, maxRetries: 3 });
+
+    const error = await rejection(service.executeQuery('SELECT 1'));
+
+    expect(error.errorType).toBe(ErrorType.CONNECTION_ERROR);
+    expect(error.sqlErrorNumber).toBe(18456);
+    expect(h.pools).toHaveLength(1);
+  });
+
+  it('reports a database that cannot be opened (numeric msnodesqlv8 code 4060) clearly', async () => {
+    h.scenario = { connectError: { name: 'ConnectionError', code: 4060, message: 'Cannot open database "Missing" requested by the login.' } };
+    const { service } = makeService({ ...windows, maxRetries: 3 });
+
+    const error = await rejection(service.executeQuery('SELECT 1', 'Missing'));
+
+    expect(error.message).toBe("Cannot open database 'Missing': it does not exist, or the login cannot access it.");
+    expect(h.pools).toHaveLength(1);
+  });
+
+  it('treats the ODBC "Operation canceled" error as the end of a full page', async () => {
+    h.scenario = {
+      recordsets: [{ columns: ['n'], rows: numbers(10) }],
+      cancelError: { name: 'RequestError', code: 'EREQUEST', state: 'HY008', message: '[Microsoft][ODBC Driver 18 for SQL Server]Operation canceled' },
+    };
+    const { service } = makeService(windows);
+
+    const result = await service.executeQuery('SELECT n FROM t');
+
+    expect(result.recordsets[0].rows).toEqual([[0], [1], [2]]);
+    expect(result.recordsets[0].hasMore).toBe(true);
+    expectRollbackAfterRequest();
+  });
+
+  it('marks the connection bad instead of closing it after a failed rollback', async () => {
+    h.scenario = {
+      recordsets: [{ columns: ['n'], rows: [[1]] }],
+      rollbackError: { name: 'TransactionError', code: 'EREQUEST', state: '08S01', message: 'Communication link failure' },
+    };
+    const { service } = makeService(windows);
+
+    await service.executeQuery('SELECT 1');
+
+    const connection = h.connections[0] as { closed: boolean; hasError?: boolean };
+    expect(connection.closed).toBe(false);
+    expect(connection.hasError).toBe(true);
+    expect(poolKeys(service)).toEqual([]);
+  });
+
+  it('still reports other request errors after a full page', async () => {
+    h.scenario = {
+      recordsets: [{ columns: ['n'], rows: numbers(10) }],
+      cancelError: { name: 'RequestError', code: 'EREQUEST', state: '42000', number: 229, message: 'The SELECT permission was denied.' },
+    };
+    const { service } = makeService(windows);
+
+    const error = await rejection(service.executeQuery('SELECT n FROM t'));
+
+    expect(error.errorType).toBe(ErrorType.PERMISSION_ERROR);
   });
 });
