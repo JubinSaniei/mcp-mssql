@@ -11,8 +11,10 @@ import {
 } from './resultFormat.js';
 import {
   buildAllowedProcedureSet,
+  isProcedureAllowed,
   prepareProcedureParameter,
   requireProcedureName,
+  wildcardEntries,
   type ProcedureParameterInput,
 } from './procedures.js';
 import { SCHEMA_QUERY, buildTableSchemas, type ForeignKeyRow, type SchemaColumnRow, type TableSchema } from './schemaModel.js';
@@ -194,9 +196,16 @@ export class DatabaseService {
         { entry, reason },
         reason === 'unqualified'
           ? 'DatabaseService: Ignoring SQL_ALLOWED_PROCEDURES entry without a schema; write it as schema.procedure.'
-          : 'DatabaseService: Ignoring invalid SQL_ALLOWED_PROCEDURES entry; use schema.procedure with letters, digits and underscores.'
+          : 'DatabaseService: Ignoring invalid SQL_ALLOWED_PROCEDURES entry; use schema.procedure with letters, digits and underscores, schema.* or *.'
       );
     });
+    const wildcards = wildcardEntries(this.allowedProcedureKeys);
+    if (wildcards.length > 0) {
+      this.logger.warn(
+        { entries: wildcards },
+        'DatabaseService: SQL_ALLOWED_PROCEDURES has a wildcard entry; every matching procedure may run, including any that run dynamic SQL. Calls are rolled back, but changes a procedure commits on its own are not.'
+      );
+    }
     this.defaultDatabase = normalizeDatabaseName(sqlConfig.database);
     this.defaultKey = this.defaultDatabase.toLowerCase();
     const configuredMaxRows = sqlConfig.maxRows;
@@ -738,8 +747,8 @@ export class DatabaseService {
 
     const name = requireProcedureName(procedure);
 
-    // Allow-list: only procedures named in SQL_ALLOWED_PROCEDURES may run
-    if (!this.allowedProcedureKeys.has(name.key)) {
+    // Allow-list: only procedures named in SQL_ALLOWED_PROCEDURES, or matched by a wildcard entry, may run
+    if (!isProcedureAllowed(this.allowedProcedureKeys, name)) {
       throw new MssqlMcpError(
         `DatabaseService: Execution of stored procedure '${procedure}' is not allowed.`,
         ErrorType.PERMISSION_ERROR,

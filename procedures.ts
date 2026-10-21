@@ -49,9 +49,37 @@ export function parseProcedureName(raw: string): ProcedureNameParseResult {
   return { ok: true, procedure: { schema, name, canonical, key: canonical.toLowerCase() } };
 }
 
+/** Allow-list key of a bare `*` entry, which allows every schema-qualified procedure. */
+const ALL_PROCEDURES_KEY = '*';
+/** Suffix of a `schema.*` allow-list key, which allows every procedure in that schema. */
+const SCHEMA_WILDCARD_SUFFIX = '.*';
+/**
+ * Schemas a bare `*` does not cover. sys holds sp_executesql, xp_cmdshell and other system
+ * procedures that run arbitrary SQL or act outside the transaction; they can be allowed
+ * only by an exact entry or an explicit `sys.*`.
+ */
+const SYSTEM_SCHEMAS: ReadonlySet<string> = new Set(['sys', 'information_schema']);
+
+/**
+ * Parses an allow-list entry: a `schema.proc` name, `schema.*` or `[schema].*` for every
+ * procedure in a schema, or a bare `*` for every procedure. Returns the lower-cased key.
+ * Requested names never take a wildcard; they go through parseProcedureName.
+ */
+function parseAllowListEntry(raw: string): { ok: true; key: string } | { ok: false; reason: 'empty' | 'unqualified' | 'invalid' } {
+  const text = raw.trim();
+  if (text === ALL_PROCEDURES_KEY) return { ok: true, key: ALL_PROCEDURES_KEY };
+  const dot = text.lastIndexOf('.');
+  if (dot >= 0 && text.slice(dot + 1).trim() === ALL_PROCEDURES_KEY) {
+    const schema = unbracket(text.slice(0, dot));
+    return schema === null ? { ok: false, reason: 'invalid' } : { ok: true, key: `${schema.toLowerCase()}${SCHEMA_WILDCARD_SUFFIX}` };
+  }
+  const parsed = parseProcedureName(text);
+  return parsed.ok ? { ok: true, key: parsed.procedure.key } : parsed;
+}
+
 /**
  * Builds the set of allowed procedure keys from configured entries. Entries that are not
- * valid schema-qualified names are skipped and reported through `onIgnored`.
+ * valid schema-qualified names or wildcards are skipped and reported through `onIgnored`.
  */
 export function buildAllowedProcedureSet(
   entries: readonly string[],
@@ -59,14 +87,32 @@ export function buildAllowedProcedureSet(
 ): Set<string> {
   const allowed = new Set<string>();
   for (const entry of entries) {
-    const parsed = parseProcedureName(entry);
+    const parsed = parseAllowListEntry(entry);
     if (parsed.ok) {
-      allowed.add(parsed.procedure.key);
+      allowed.add(parsed.key);
     } else if (parsed.reason !== 'empty') {
       onIgnored(entry, parsed.reason);
     }
   }
   return allowed;
+}
+
+/**
+ * True when the procedure is listed by name, by a `schema.*` entry, or by a bare `*` entry;
+ * `*` does not cover SYSTEM_SCHEMAS.
+ */
+export function isProcedureAllowed(allowed: ReadonlySet<string>, procedure: ProcedureName): boolean {
+  const schema = procedure.schema.toLowerCase();
+  return (
+    allowed.has(procedure.key) ||
+    allowed.has(`${schema}${SCHEMA_WILDCARD_SUFFIX}`) ||
+    (allowed.has(ALL_PROCEDURES_KEY) && !SYSTEM_SCHEMAS.has(schema))
+  );
+}
+
+/** The `*` and `schema.*` keys in the allow-list. */
+export function wildcardEntries(allowed: ReadonlySet<string>): string[] {
+  return [...allowed].filter((key) => key === ALL_PROCEDURES_KEY || key.endsWith(SCHEMA_WILDCARD_SUFFIX));
 }
 
 /** Parses a requested procedure name, throwing a validation error that says what is wrong. */

@@ -96,7 +96,7 @@ You can override any of the variables defined at the top of the `docker-run.sh` 
 -   `SQL_RETRY_MAX_DELAY_MS`
 -   `CACHE_TTL_MS`
 -   `SQL_ALLOWED_DATABASES` (comma-separated list, e.g., "db1,db2")
--   `SQL_ALLOWED_PROCEDURES` (comma-separated `schema.proc` names; empty disables `execute_stored_procedure`)
+-   `SQL_ALLOWED_PROCEDURES` (comma-separated `schema.proc` names or `schema.*` / `*` wildcards; empty disables `execute_stored_procedure`)
 -   `SQL_MAX_ROWS`
 -   `LOG_LEVEL`
 -   `CONTAINER_NAME`
