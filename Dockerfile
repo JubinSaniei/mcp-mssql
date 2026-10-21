@@ -4,9 +4,9 @@ FROM node:22-slim AS build
 # Set working directory
 WORKDIR /app
 
-# Copy package files and install dependencies
+# Copy package files and install dependencies (msnodesqlv8, for Windows authentication, is not used on Linux)
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --omit=optional
 
 # Copy source files
 COPY . .
@@ -30,7 +30,7 @@ RUN addgroup --system app && adduser --system --ingroup app app
 COPY package*.json ./
 
 # Install only production dependencies
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --omit=optional
 
 # Copy the compiled server
 COPY --from=build /app/dist ./dist

@@ -8,7 +8,18 @@ export const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', '
 
 export type LogLevel = (typeof LOG_LEVELS)[number];
 
+/** `sql` logs in with SQL_USER/SQL_PASSWORD; `windows` logs in as the Windows account running the server. */
+export const AUTHENTICATION_MODES = ['sql', 'windows'] as const;
+
+export type AuthenticationMode = (typeof AUTHENTICATION_MODES)[number];
+
+/** ODBC driver used for Windows authentication unless SQL_ODBC_DRIVER names another. */
+export const DEFAULT_ODBC_DRIVER = 'ODBC Driver 18 for SQL Server';
+
 export interface AppConfig {
+  authenticationMode: AuthenticationMode;
+  /** ODBC driver name; used only for Windows authentication. */
+  odbcDriver: string;
   user: string;
   password: string;
   server: string;
@@ -77,6 +88,15 @@ const list = () =>
 
 const envSchema = z
   .object({
+    SQL_AUTH: z
+      .string()
+      .optional()
+      .transform((value) => value?.trim().toLowerCase() || 'sql')
+      .pipe(z.enum(AUTHENTICATION_MODES)),
+    SQL_ODBC_DRIVER: z
+      .string()
+      .optional()
+      .transform((value) => value?.trim() || DEFAULT_ODBC_DRIVER),
     SQL_USER: text('sa'),
     SQL_PASSWORD: text('yourStrong(!)Password'),
     SQL_SERVER: text('localhost'),
@@ -131,6 +151,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const e = parsed.data;
 
   return {
+    authenticationMode: e.SQL_AUTH,
+    odbcDriver: e.SQL_ODBC_DRIVER,
     user: e.SQL_USER,
     password: e.SQL_PASSWORD,
     server: e.SQL_SERVER,

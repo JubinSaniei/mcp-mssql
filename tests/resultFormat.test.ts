@@ -140,6 +140,23 @@ describe('RecordsetPager', () => {
     expect(rs.rows[1]).toEqual([2, null, null, null, null]);
   });
 
+  it('trims trailing fractional zeros when the driver reports no scale (msnodesqlv8)', () => {
+    const at = (ms: number) => new Date(Date.UTC(2026, 9, 1, 12, 34, 56, ms));
+    const pager = new RecordsetPager({ offset: 0, limit: 10 });
+    feed(
+      pager,
+      [
+        { name: 'd2', index: 0, type: sql.DateTime2 },
+        { name: 't', index: 1, type: sql.Time },
+        { name: 'dto', index: 2, type: sql.DateTimeOffset },
+        { name: 'dt', index: 3, type: sql.DateTime },
+      ],
+      [[at(0), at(120), at(500), at(0)]]
+    );
+    const [rs] = pager.recordsets();
+    expect(rs.rows[0]).toEqual(['2026-10-01T12:34:56', '12:34:56.12', '2026-10-01T12:34:56.5+00:00', '2026-10-01T12:34:56.000']);
+  });
+
   it('starts an implicit result set for rows without metadata', () => {
     const pager = new RecordsetPager({ offset: 0, limit: 10 });
     pager.addRow([1]);

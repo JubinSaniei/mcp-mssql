@@ -14,6 +14,8 @@ function configError(env: NodeJS.ProcessEnv): ConfigError {
 describe('loadConfig defaults', () => {
   it('uses the documented defaults when nothing is set', () => {
     expect(loadConfig({})).toEqual({
+      authenticationMode: 'sql',
+      odbcDriver: 'ODBC Driver 18 for SQL Server',
       user: 'sa',
       password: 'yourStrong(!)Password',
       server: 'localhost',
@@ -99,6 +101,18 @@ describe('loadConfig values', () => {
     expect(loadConfig({ SQL_TRUST_SERVER_CERT: 'yes' }).options.trustServerCertificate).toBe(false);
   });
 
+  it('reads the authentication mode regardless of case and padding', () => {
+    expect(loadConfig({ SQL_AUTH: 'windows' }).authenticationMode).toBe('windows');
+    expect(loadConfig({ SQL_AUTH: ' Windows ' }).authenticationMode).toBe('windows');
+    expect(loadConfig({ SQL_AUTH: 'SQL' }).authenticationMode).toBe('sql');
+    expect(loadConfig({ SQL_AUTH: '' }).authenticationMode).toBe('sql');
+  });
+
+  it('reads the ODBC driver name, trimmed', () => {
+    expect(loadConfig({ SQL_ODBC_DRIVER: ' ODBC Driver 17 for SQL Server ' }).odbcDriver).toBe('ODBC Driver 17 for SQL Server');
+    expect(loadConfig({ SQL_ODBC_DRIVER: '  ' }).odbcDriver).toBe('ODBC Driver 18 for SQL Server');
+  });
+
   it('splits and trims the allow-lists, dropping empty entries', () => {
     const config = loadConfig({ SQL_ALLOWED_DATABASES: ' Sales , ,HR,', SQL_ALLOWED_PROCEDURES: 'dbo.A, [rpt].[B] ,' });
     expect(config.allowedDatabases).toEqual(['Sales', 'HR']);
@@ -131,6 +145,12 @@ describe('loadConfig validation', () => {
 
   it.each(['Info', 'INFO', ' debug '])('accepts the log level %j regardless of case and padding', (value) => {
     expect(loadConfig({ LOG_LEVEL: value }).logLevel).toBe(value.trim().toLowerCase());
+  });
+
+  it('rejects an unknown authentication mode', () => {
+    const error = configError({ SQL_AUTH: 'kerberos' });
+    expect(error.issues).toHaveLength(1);
+    expect(error.issues[0]).toContain('SQL_AUTH');
   });
 
   it('rejects an unknown log level', () => {
